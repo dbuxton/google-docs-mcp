@@ -287,8 +287,9 @@ def search_replace(
     paragraphs = _extract_paragraphs(doc)
     full_text, text_map = _build_full_text_map(paragraphs)
 
+    # Build list of (ft_start, ft_end) tuples
     if regex:
-        matches = list(re.finditer(find, full_text))
+        matches = [(m.start(), m.end()) for m in re.finditer(find, full_text)]
     else:
         matches = []
         search_from = 0
@@ -296,7 +297,7 @@ def search_replace(
             pos = full_text.find(find, search_from)
             if pos == -1:
                 break
-            matches.append(type("M", (), {"start": lambda s=pos: s, "end": lambda e=pos + len(find): e, "group": lambda: find})())
+            matches.append((pos, pos + len(find)))
             search_from = pos + 1
 
     if not matches:
@@ -308,9 +309,7 @@ def search_replace(
             f"Occurrence {occurrence} not found. Document has {len(matches)} occurrence(s) of {find!r}"
         )
 
-    match = matches[target_idx]
-    ft_start = match.start() if callable(match.start) else match.start
-    ft_end = match.end() if callable(match.end) else match.end
+    ft_start, ft_end = matches[target_idx]
 
     doc_start = _full_text_pos_to_doc_index(ft_start, text_map)
     doc_end = _full_text_pos_to_doc_index(ft_end - 1, text_map) + 1
@@ -528,8 +527,9 @@ def batch_replace(doc_id: str, replacements: list[dict]) -> dict:
         occurrence = rep.get("occurrence", 1)
         is_regex = rep.get("regex", False)
 
+        # Build list of (ft_start, ft_end) tuples
         if is_regex:
-            matches = list(re.finditer(find, full_text))
+            matches = [(m.start(), m.end()) for m in re.finditer(find, full_text)]
         else:
             matches = []
             search_from = 0
@@ -537,8 +537,7 @@ def batch_replace(doc_id: str, replacements: list[dict]) -> dict:
                 pos = full_text.find(find, search_from)
                 if pos == -1:
                     break
-                end = pos + len(find)
-                matches.append((pos, end))
+                matches.append((pos, pos + len(find)))
                 search_from = pos + 1
 
         if not matches:
@@ -546,11 +545,7 @@ def batch_replace(doc_id: str, replacements: list[dict]) -> dict:
 
         if occurrence == 0:
             # Replace all
-            for m in matches:
-                if isinstance(m, tuple):
-                    ft_start, ft_end = m
-                else:
-                    ft_start, ft_end = m.start(), m.end()
+            for ft_start, ft_end in matches:
                 ds = _full_text_pos_to_doc_index(ft_start, text_map)
                 de = _full_text_pos_to_doc_index(ft_end - 1, text_map) + 1
                 changes.append((ds, de, replace_text, full_text[ft_start:ft_end]))
@@ -558,11 +553,7 @@ def batch_replace(doc_id: str, replacements: list[dict]) -> dict:
             idx = occurrence - 1
             if idx >= len(matches):
                 raise ValueError(f"Occurrence {occurrence} not found for {find!r}")
-            m = matches[idx]
-            if isinstance(m, tuple):
-                ft_start, ft_end = m
-            else:
-                ft_start, ft_end = m.start(), m.end()
+            ft_start, ft_end = matches[idx]
             ds = _full_text_pos_to_doc_index(ft_start, text_map)
             de = _full_text_pos_to_doc_index(ft_end - 1, text_map) + 1
             changes.append((ds, de, replace_text, full_text[ft_start:ft_end]))
