@@ -1,24 +1,15 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "google-drive-mcp"
 version = "0.2.0"
-description = "Surgical Google Docs editing for AI agents — search/replace, insert, comments, and more"
+description = "MCP server for surgical Google Docs editing — search-by-text, not indices"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-keywords = ["mcp", "google-docs", "google-drive", "llm", "claude", "ai-agents"]
-authors = [
-    { name = "David Buxton", email = "david@harriethq.com" }
-]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "Topic :: Software Development :: Libraries",
-    "Programming Language :: Python :: 3",
-]
+license = {text = "MIT"}
+keywords = ["mcp", "google-docs", "google-drive", "llm", "ai-agents"]
 dependencies = [
     "google-api-python-client>=2.100.0",
     "google-auth>=2.23.0",
@@ -34,8 +25,7 @@ google-drive-mcp-auth = "auth_setup:main"
 [project.urls]
 Homepage = "https://github.com/dbuxton/google-drive-mcp"
 Repository = "https://github.com/dbuxton/google-drive-mcp"
-Issues = "https://github.com/dbuxton/google-drive-mcp/issues"
 
-[tool.hatch.build.targets.wheel]
-packages = ["."]
-include = ["server.py", "docs_edit.py", "auth_setup.py"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*.py"]
