@@ -37,7 +37,7 @@ import docs_edit
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
 mcp = FastMCP(
-    name="google-docs-mcp",
+    name="google-drive-mcp",
     instructions="""
 Google Docs surgical editing tools.
 
@@ -441,5 +441,9 @@ def docs_create(title: str, initial_text: str = "") -> str:
     }, indent=2)
 
 
-if __name__ == "__main__":
+def main():
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

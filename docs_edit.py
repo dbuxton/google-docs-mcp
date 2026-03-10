@@ -44,6 +44,10 @@ log = logging.getLogger("docs_edit")
 # Auth helpers
 # ---------------------------------------------------------------------------
 
+# Standalone default (auth_setup.py output)
+STANDALONE_TOKEN_PATH = Path.home() / ".google-drive-mcp" / "token.json"
+
+# Gog fallback paths (backward compat)
 GOG_CREDENTIALS_PATH = Path("/config/gogcli/credentials.json")
 GOG_TOKEN_CACHE = Path("/tmp/docs_edit_token_cache.json")
 
@@ -52,19 +56,14 @@ def _export_gog_token(email: str = "david@harriethq.com") -> dict:
     """Export token from gog keyring using GOG_KEYRING_PASSWORD env var."""
     password = os.environ.get("GOG_KEYRING_PASSWORD")
     if not password:
-        raise RuntimeError(
-            "GOG_KEYRING_PASSWORD not set. Cannot export gog token. "
-            "Set GOOGLE_DOCS_TOKEN_FILE to a pre-exported token path instead."
-        )
+        raise RuntimeError("GOG_KEYRING_PASSWORD not set")
     env = {**os.environ, "GOG_KEYRING_PASSWORD": password}
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
         tmp = f.name
     try:
         result = subprocess.run(
             ["gog", "auth", "tokens", "export", email, "--out", tmp, "--overwrite", "-y"],
-            env=env,
-            capture_output=True,
-            text=True,
+            env=env, capture_output=True, text=True,
         )
         if result.returncode != 0:
             raise RuntimeError(f"gog token export failed: {result.stderr}")
@@ -77,28 +76,45 @@ def _export_gog_token(email: str = "david@harriethq.com") -> dict:
 
 
 def _load_token() -> dict:
-    """Load gog-exported token from env, auto-export, or cache."""
+    """
+    Load token data. Priority:
+      1. GOOGLE_DRIVE_MCP_TOKEN env var  (standalone auth_setup.py output)
+      2. GOOGLE_DOCS_TOKEN_FILE env var  (legacy / gog compat)
+      3. ~/.google-drive-mcp/token.json  (standalone default location)
+      4. GOG_KEYRING_PASSWORD auto-export (gog compat)
+      5. Cached gog token
+    """
+    # 1. Standalone env var
+    token_file = os.environ.get("GOOGLE_DRIVE_MCP_TOKEN")
+    if token_file:
+        return json.loads(Path(token_file).read_text())
+
+    # 2. Legacy env var
     token_file = os.environ.get("GOOGLE_DOCS_TOKEN_FILE")
     if token_file:
         return json.loads(Path(token_file).read_text())
 
-    # Try auto-export (uses GOG_KEYRING_PASSWORD)
+    # 3. Default standalone location
+    if STANDALONE_TOKEN_PATH.exists():
+        return json.loads(STANDALONE_TOKEN_PATH.read_text())
+
+    # 4. Gog auto-export
     try:
         token = _export_gog_token()
-        # Cache it
         GOG_TOKEN_CACHE.write_text(json.dumps(token))
         return token
     except RuntimeError as e:
-        log.warning("Auto-export failed: %s", e)
+        log.warning("Gog auto-export failed: %s", e)
 
-    # Try cache
+    # 5. Gog cache
     if GOG_TOKEN_CACHE.exists():
-        log.info("Using cached token from %s", GOG_TOKEN_CACHE)
+        log.info("Using cached gog token")
         return json.loads(GOG_TOKEN_CACHE.read_text())
 
     raise RuntimeError(
-        "No Google credentials found. Set GOOGLE_DOCS_TOKEN_FILE to a gog-exported "
-        "token JSON, or set GOG_KEYRING_PASSWORD for auto-export."
+        "No Google credentials found.\n"
+        "Run: python3 auth_setup.py --credentials ~/credentials.json\n"
+        "Or set GOOGLE_DRIVE_MCP_TOKEN to your token file path."
     )
 
 
@@ -108,15 +124,33 @@ def _load_creds():
     from google.auth.transport.requests import Request
 
     token_data = _load_token()
-    creds_data = json.loads(GOG_CREDENTIALS_PATH.read_text())
+
+    # Self-contained token — auth_setup.py embeds client_id / client_secret directly
+    # (also handle legacy _client_id / _client_secret with underscore prefix)
+    client_id = token_data.get("client_id") or token_data.get("_client_id")
+    client_secret = token_data.get("client_secret") or token_data.get("_client_secret")
+    token_uri = token_data.get("token_uri") or token_data.get("_token_uri", "https://oauth2.googleapis.com/token")
+
+    # Gog compat: read from separate credentials.json if not embedded
+    if not client_id and GOG_CREDENTIALS_PATH.exists():
+        gog_creds = json.loads(GOG_CREDENTIALS_PATH.read_text())
+        client_id = gog_creds.get("client_id")
+        client_secret = gog_creds.get("client_secret")
+
+    if not client_id:
+        raise RuntimeError(
+            "No client_id found. Re-run auth_setup.py to generate a self-contained token."
+        )
+
+    scopes = [s for s in token_data.get("scopes", []) if s not in ("email", "openid")]
 
     creds = Credentials(
         token=None,
         refresh_token=token_data["refresh_token"],
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=creds_data["client_id"],
-        client_secret=creds_data["client_secret"],
-        scopes=[s for s in token_data.get("scopes", []) if s != "email"],  # email scope not always granted
+        token_uri=token_uri,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=scopes,
     )
     creds.refresh(Request())
     return creds
