@@ -687,22 +687,20 @@ def add_comment(
     if not named_range_id:
         raise RuntimeError("Failed to create named range — no ID returned by Docs API")
 
-    # Build the Drive API anchor JSON for a Google Docs named range
-    anchor_json = json.dumps({
-        "r": "head",
-        "a": [
-            {"t": "g", "v": doc_id},
-            {"t": "r", "v": named_range_id},
-        ],
-    })
-
+    # The correct anchor format for Google Docs is the bare named range ID
+    # (e.g. "kix.abc123") as a plain string — NOT a JSON object.
+    # quotedFileContent provides the fallback display text.
     from googleapiclient.discovery import build
     drive = build("drive", "v3", credentials=_load_creds())
     comment_result = drive.comments().create(
         fileId=doc_id,
         body={
             "content": comment,
-            "anchor": anchor_json,
+            "anchor": named_range_id,
+            "quotedFileContent": {
+                "mimeType": "text/html",
+                "value": full_text[ft_start:ft_end],
+            },
         },
         fields="id,content,anchor",
     ).execute()
