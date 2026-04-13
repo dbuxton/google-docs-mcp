@@ -26,6 +26,7 @@ Auth (in priority order):
 Setup:
   python3 auth_setup.py --credentials ~/credentials.json
   python3 auth_setup.py --credentials ~/credentials.json --headless  # no browser
+  GOOGLE_DRIVE_MCP_CLIENT_ID=... GOOGLE_DRIVE_MCP_CLIENT_SECRET=... python3 auth_setup.py
 
 Transport: stdio (Claude Desktop / OpenClaw MCP config)
 """

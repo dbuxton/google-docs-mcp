@@ -58,6 +58,15 @@ uvx --from git+https://github.com/dbuxton/google-drive-mcp \
   google-drive-mcp-auth --credentials ~/credentials.json
 ```
 
+**Or use env vars instead of a credentials file:**
+```bash
+export GOOGLE_DRIVE_MCP_CLIENT_ID="your-google-client-id"
+export GOOGLE_DRIVE_MCP_CLIENT_SECRET="your-google-client-secret"
+
+uvx --from git+https://github.com/dbuxton/google-drive-mcp \
+  google-drive-mcp-auth
+```
+
 **Headless / remote server — no browser on device:**
 ```bash
 uvx --from git+https://github.com/dbuxton/google-drive-mcp \
@@ -71,6 +80,12 @@ uvx --from git+https://github.com/dbuxton/google-drive-mcp \
 uvx --from git+https://github.com/dbuxton/google-drive-mcp \
   google-drive-mcp-auth --credentials ~/credentials.json --code "4/0Afr..."
 ```
+
+`google-drive-mcp-auth` resolves OAuth client credentials in this order:
+
+1. `--credentials /path/to/credentials.json`
+2. `--client-id` and `--client-secret`
+3. `GOOGLE_DRIVE_MCP_CLIENT_ID` and `GOOGLE_DRIVE_MCP_CLIENT_SECRET`
 
 Token is saved to `~/.google-drive-mcp/token.json` by default. Override with `--out /path/to/token.json`.
 

@@ -11,6 +11,7 @@ Usage:
     python3 auth_setup.py --credentials ~/credentials.json
     python3 auth_setup.py --credentials ~/credentials.json --headless
     python3 auth_setup.py --credentials ~/credentials.json --code "4/0Afr..."
+    GOOGLE_DRIVE_MCP_CLIENT_ID=... GOOGLE_DRIVE_MCP_CLIENT_SECRET=... python3 auth_setup.py
 
 Get credentials.json:
     https://console.cloud.google.com/
@@ -54,6 +55,8 @@ SCOPES = [
 
 REDIRECT_PORT = 14399
 REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/oauth2/callback"
+CLIENT_ID_ENV_VAR = "GOOGLE_DRIVE_MCP_CLIENT_ID"
+CLIENT_SECRET_ENV_VAR = "GOOGLE_DRIVE_MCP_CLIENT_SECRET"
 
 
 def load_client_config(creds_path: Path) -> dict:
@@ -231,6 +234,9 @@ Examples:
   # Normal (local browser opens automatically):
   python3 auth_setup.py --credentials ~/credentials.json
 
+  # Or use env vars instead of a credentials file:
+  GOOGLE_DRIVE_MCP_CLIENT_ID=... GOOGLE_DRIVE_MCP_CLIENT_SECRET=... python3 auth_setup.py
+
   # Headless / remote server (prints URL, paste back redirect):
   python3 auth_setup.py --credentials ~/credentials.json --headless
 
@@ -247,11 +253,11 @@ Examples:
     )
     parser.add_argument(
         "--client-id",
-        help="OAuth client ID (alternative to --credentials file)",
+        help=f"OAuth client ID (alternative to --credentials file; defaults to ${CLIENT_ID_ENV_VAR} if set)",
     )
     parser.add_argument(
         "--client-secret",
-        help="OAuth client secret (alternative to --credentials file)",
+        help=f"OAuth client secret (alternative to --credentials file; defaults to ${CLIENT_SECRET_ENV_VAR} if set)",
     )
     parser.add_argument(
         "--out", "-o",
@@ -269,6 +275,11 @@ Examples:
     )
     args = parser.parse_args()
 
+    env_client_id = os.environ.get(CLIENT_ID_ENV_VAR)
+    env_client_secret = os.environ.get(CLIENT_SECRET_ENV_VAR)
+    client_id = args.client_id or env_client_id
+    client_secret = args.client_secret or env_client_secret
+
     # Resolve credentials
     if args.credentials:
         creds_path = Path(args.credentials).expanduser()
@@ -278,11 +289,14 @@ Examples:
         cfg = load_client_config(creds_path)
         client_id = cfg["client_id"]
         client_secret = cfg["client_secret"]
-    elif args.client_id and args.client_secret:
-        client_id = args.client_id
-        client_secret = args.client_secret
+    elif client_id and client_secret:
+        pass
     else:
-        print("Error: provide --credentials or both --client-id and --client-secret", file=sys.stderr)
+        print(
+            "Error: provide --credentials, both --client-id and --client-secret, "
+            f"or set both {CLIENT_ID_ENV_VAR} and {CLIENT_SECRET_ENV_VAR}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     out_path = Path(args.out).expanduser()

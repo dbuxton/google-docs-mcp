@@ -46,6 +46,8 @@ log = logging.getLogger("docs_edit")
 
 # Standalone default (auth_setup.py output)
 STANDALONE_TOKEN_PATH = Path.home() / ".google-drive-mcp" / "token.json"
+CLIENT_ID_ENV_VAR = "GOOGLE_DRIVE_MCP_CLIENT_ID"
+CLIENT_SECRET_ENV_VAR = "GOOGLE_DRIVE_MCP_CLIENT_SECRET"
 
 # Gog fallback paths (backward compat)
 GOG_CREDENTIALS_PATH = Path("/config/gogcli/credentials.json")
@@ -131,15 +133,20 @@ def _load_creds():
     client_secret = token_data.get("client_secret") or token_data.get("_client_secret")
     token_uri = token_data.get("token_uri") or token_data.get("_token_uri", "https://oauth2.googleapis.com/token")
 
+    # Environment override allows using external client credentials instead of a credentials.json file.
+    client_id = client_id or os.environ.get(CLIENT_ID_ENV_VAR)
+    client_secret = client_secret or os.environ.get(CLIENT_SECRET_ENV_VAR)
+
     # Gog compat: read from separate credentials.json if not embedded
     if not client_id and GOG_CREDENTIALS_PATH.exists():
         gog_creds = json.loads(GOG_CREDENTIALS_PATH.read_text())
         client_id = gog_creds.get("client_id")
         client_secret = gog_creds.get("client_secret")
 
-    if not client_id:
+    if not client_id or not client_secret:
         raise RuntimeError(
-            "No client_id found. Re-run auth_setup.py to generate a self-contained token."
+            "No OAuth client credentials found. Re-run auth_setup.py to generate a self-contained token, "
+            f"or set {CLIENT_ID_ENV_VAR} and {CLIENT_SECRET_ENV_VAR}."
         )
 
     scopes = [s for s in token_data.get("scopes", []) if s not in ("email", "openid")]
