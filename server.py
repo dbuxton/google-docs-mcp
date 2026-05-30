@@ -360,21 +360,28 @@ def docs_resolve_comment(doc_id: str, comment_id: str, reply: str = "") -> str:
     creds = docs_edit._load_creds()
     drive = build("drive", "v3", credentials=creds)
 
-    if reply:
-        drive.replies().create(
-            fileId=doc_id,
-            commentId=comment_id,
-            body={"content": reply},
-            fields="id",
-        ).execute()
-
-    drive.comments().update(
+    # In Drive v3, the `resolved` field on the Comment resource is effectively
+    # set by posting a reply with action="resolve" — `comments.update` either
+    # rejects the call (missing `content` -> 400) or silently no-ops on
+    # `resolved`. The canonical way to close a comment is replies.create with
+    # action="resolve", which also matches what the Docs UI does internally.
+    #
+    # The Drive API requires non-empty `content` on every reply, so when the
+    # caller didn't supply one we fall back to a short placeholder.
+    content = reply if reply else "Resolved."
+    result = drive.replies().create(
         fileId=doc_id,
         commentId=comment_id,
-        body={"resolved": True},
-        fields="id,resolved",
+        body={"content": content, "action": "resolve"},
+        fields="id,action,content",
     ).execute()
-    return json.dumps({"ok": True, "comment_id": comment_id, "resolved": True}, indent=2)
+    return json.dumps({
+        "ok": True,
+        "comment_id": comment_id,
+        "resolved": True,
+        "reply_id": result.get("id"),
+        "reply_content": result.get("content"),
+    }, indent=2)
 
 
 @mcp.tool
