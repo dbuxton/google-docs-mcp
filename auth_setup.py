@@ -126,12 +126,17 @@ def get_email(access_token: str) -> str:
 
 def save_token(token_response: dict, client_id: str, client_secret: str, out_path: Path):
     email = get_email(token_response.get("access_token", ""))
+    # Google may silently drop a requested scope (e.g. a sensitive one still
+    # pending verification) — save what was actually granted, not what we asked
+    # for, or a later refresh() fails with invalid_scope.
+    granted_scope = token_response.get("scope", "")
+    scopes = granted_scope.split() if granted_scope else SCOPES
     token_data = {
         "email": email,
         "client_id": client_id,
         "client_secret": client_secret,
         "refresh_token": token_response["refresh_token"],
-        "scopes": SCOPES,
+        "scopes": scopes,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(token_data, indent=2))
