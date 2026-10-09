@@ -112,5 +112,196 @@ class NonGoogleDocTest(unittest.TestCase):
             docs_edit.get(DOC_ID)
 
 
+def _thread(comment_id: str, status: str = "OPEN", replies: list | None = None) -> dict:
+    return {
+        "commentId": comment_id,
+        "status": status,
+        "anchorId": f"anchor-{comment_id}",
+        "plainTextQuote": "one month",
+        "headPost": {
+            "postId": f"{comment_id}-head",
+            "content": f"Comment {comment_id}",
+            "author": {"displayName": "Dana"},
+            "createTime": "2026-10-09T10:00:00Z",
+            "assigneeEmail": "hr@example.com",
+        },
+        "replies": replies or [],
+    }
+
+
+class CommentTest(unittest.TestCase):
+    """Comments go through the Docs API's native comment requests, not Drive."""
+
+    def setUp(self):
+        self.docs = mock.MagicMock()
+        self.docs.documents().get().execute.return_value = {
+            "title": "Contract",
+            "body": {
+                "content": [
+                    {
+                        "startIndex": 1,
+                        "endIndex": 26,
+                        "paragraph": {
+                            "elements": [
+                                {
+                                    "startIndex": 1,
+                                    "endIndex": 26,
+                                    "textRun": {"content": "Notice period: one month\n"},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+        self.batch_update = self.docs.documents().batchUpdate
+        self.drive = mock.MagicMock()
+        services = {"docs": self.docs, "drive": self.drive}
+        patcher = mock.patch.object(
+            docs_edit, "_get_service", side_effect=lambda api, version: services[api]
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _sent_requests(self) -> list:
+        return self.batch_update.call_args.kwargs["body"]["requests"]
+
+    def test_add_comment_anchors_to_matched_text(self):
+        self.batch_update().execute.return_value = {
+            "replies": [{"insertComment": {"commentThread": {"commentId": "c1"}}}]
+        }
+
+        result = docs_edit.add_comment(DOC_ID, "Too short?", "one month")
+
+        self.assertEqual(
+            self._sent_requests(),
+            [
+                {
+                    "insertComment": {
+                        "range": {"startIndex": 16, "endIndex": 25},
+                        "content": "Too short?",
+                    }
+                }
+            ],
+        )
+        self.assertEqual(result["comment_id"], "c1")
+        self.assertEqual(result["anchored_to"], "one month")
+        self.assertEqual(result["at_index"], 16)
+        self.drive.comments.assert_not_called()
+
+    def test_add_comment_can_assign_someone(self):
+        self.batch_update().execute.return_value = {
+            "replies": [{"insertComment": {"commentThread": {"commentId": "c1"}}}]
+        }
+
+        docs_edit.add_comment(
+            DOC_ID, "Please confirm", "Notice", assignee_email="hr@example.com"
+        )
+
+        self.assertEqual(
+            self._sent_requests()[0]["insertComment"]["assigneeEmailAddress"],
+            "hr@example.com",
+        )
+
+    def test_read_comments_returns_open_threads_with_quoted_text(self):
+        self.docs.documents().get().execute.return_value = {
+            "comments": [
+                _thread(
+                    "c1",
+                    replies=[
+                        {
+                            "postId": "r1",
+                            "content": "Agreed",
+                            "author": {"displayName": "Sam"},
+                            "createTime": "2026-10-09T11:00:00Z",
+                        }
+                    ],
+                ),
+                _thread("c2", status="RESOLVED"),
+            ]
+        }
+
+        result = docs_edit.read_comments(DOC_ID)
+
+        self.docs.documents().get.assert_called_with(
+            documentId=DOC_ID,
+            suggestionsViewMode="SUGGESTIONS_INLINE",
+            commentsViewMode="COMMENTS_VIEW_MODE_INCLUDED",
+            includeTabsContent=True,
+            fields="comments",
+        )
+        self.assertEqual(result["count"], 1)
+        comment = result["comments"][0]
+        self.assertEqual(comment["id"], "c1")
+        self.assertEqual(comment["content"], "Comment c1")
+        self.assertEqual(comment["quoted_text"], "one month")
+        self.assertEqual(comment["assignee"], "hr@example.com")
+        self.assertFalse(comment["resolved"])
+        self.assertEqual(
+            comment["replies"],
+            [{"id": "r1", "author": "Sam", "content": "Agreed", "created": "2026-10-09T11:00:00Z"}],
+        )
+
+    def test_read_comments_can_include_resolved(self):
+        self.docs.documents().get().execute.return_value = {
+            "comments": [_thread("c1"), _thread("c2", status="RESOLVED")]
+        }
+
+        result = docs_edit.read_comments(DOC_ID, include_resolved=True)
+
+        self.assertEqual([c["id"] for c in result["comments"]], ["c1", "c2"])
+        self.assertTrue(result["comments"][1]["resolved"])
+
+    def test_reply_to_comment(self):
+        self.batch_update().execute.return_value = {
+            "replies": [{"addCommentReply": {"post": {"postId": "r9", "content": "Done"}}}]
+        }
+
+        result = docs_edit.reply_to_comment(DOC_ID, "c1", "Done")
+
+        self.assertEqual(
+            self._sent_requests(),
+            [{"addCommentReply": {"commentId": "c1", "post": {"content": "Done"}}}],
+        )
+        self.assertEqual(result["reply_id"], "r9")
+
+    def test_resolve_comment_with_final_reply_is_one_post(self):
+        self.batch_update().execute.return_value = {
+            "replies": [{"addCommentReply": {"post": {"postId": "r9"}}}]
+        }
+
+        docs_edit.resolve_comment(DOC_ID, "c1", "Fixed in v2")
+
+        self.assertEqual(
+            self._sent_requests(),
+            [
+                {
+                    "addCommentReply": {
+                        "commentId": "c1",
+                        "post": {"commentAction": "RESOLVE", "content": "Fixed in v2"},
+                    }
+                }
+            ],
+        )
+
+    def test_resolve_comment_without_reply(self):
+        self.batch_update().execute.return_value = {
+            "replies": [{"addCommentReply": {"post": {"postId": "r9"}}}]
+        }
+
+        docs_edit.resolve_comment(DOC_ID, "c1")
+
+        self.assertEqual(
+            self._sent_requests()[0]["addCommentReply"]["post"], {"commentAction": "RESOLVE"}
+        )
+
+    def test_delete_comment(self):
+        self.batch_update().execute.return_value = {"replies": [{}]}
+
+        docs_edit.delete_comment(DOC_ID, "c1")
+
+        self.assertEqual(self._sent_requests(), [{"deleteComment": {"commentId": "c1"}}])
+
+
 if __name__ == "__main__":
     unittest.main()

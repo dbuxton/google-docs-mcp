@@ -50,7 +50,6 @@ uv tool install --from git+https://github.com/dbuxton/google-docs-mcp google-doc
 3. Enable these APIs (**APIs & Services → Library**):
    - **Google Docs API**
    - **Google Drive API**
-   - **Google Apps Script API** *(for inline-anchored comments)*
 4. Go to **APIs & Services → Credentials**
 5. Click **Create Credentials → OAuth 2.0 Client ID**
 6. Application type: **Desktop App**
@@ -143,38 +142,6 @@ Token is saved to `~/.google-docs-mcp/token.json` by default. Override with `--o
   }
 }
 ```
-
-### Optional: Apps Script bridge for bookmark-jump comments
-
-If you want `docs_add_comment(..., bookmark_jump=true)` to append a real
-`#bookmark=id...` jump URL into the comment body, set up one persistent Apps
-Script bridge project and expose its script ID via an env var.
-
-Required one-time setup:
-
-1. Enable the **Apps Script API** for the Google account at
-   <https://script.google.com/home/usersettings>
-2. Create a standalone Apps Script project to use as the bridge
-3. In that Apps Script project, open **Project Settings** and switch it to the
-   **same standard Google Cloud project** as the OAuth client used by
-   `google-docs-mcp`
-4. In that same Google Cloud project, ensure **Apps Script API** is enabled
-5. Set the bridge script ID in the MCP process environment:
-
-```bash
-export GOOGLE_DOCS_MCP_APPS_SCRIPT_ID="1C6nchmQRobIwK8ELFe29k-XV2t7mUnhKiSpEKHThXOFHAL6Ahy4_Xju4"
-```
-
-Example `uvx` launch with both token + Apps Script bridge:
-
-```bash
-GOOGLE_DOCS_MCP_TOKEN="$HOME/.google-docs-mcp/token.json" \
-GOOGLE_DOCS_MCP_APPS_SCRIPT_ID="your-apps-script-id" \
-uvx --from git+https://github.com/dbuxton/google-docs-mcp google-docs-mcp
-```
-
-If the Apps Script bridge is still using its hidden default project, `scripts.run`
-fails even when account-level Apps Script access is enabled.
 
 ---
 
@@ -329,40 +296,26 @@ Returns `{id, title, webViewLink}`.
 
 ### Comments
 
-#### `docs_add_comment(doc_id, comment, anchor_text, occurrence, include_anchor_text, bookmark_jump)`
-Add a comment anchored to specific text in the document.
+#### `docs_add_comment(doc_id, comment, anchor_text, occurrence, assignee_email)`
+Add a comment anchored to specific text in the document. It shows in the Docs UI as a normal inline highlight on that text.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `doc_id` | string | required | Google Doc ID |
-| `comment` | string | required | Comment text |
+| `comment` | string | required | Comment text (max 2048 UTF-8 bytes) |
 | `anchor_text` | string | required | Text in the document to attach the comment to |
 | `occurrence` | int | `1` | Which occurrence of `anchor_text` to use |
-| `include_anchor_text` | bool | `true` | Append the matched anchor text into the comment body |
-| `bookmark_jump` | bool | `false` | Use the Apps Script bridge to create a bookmark and append a jump URL |
+| `assignee_email` | string | `""` | Assign the comment to this user as an action item |
 
-Use a short, distinctive phrase for `anchor_text` — a few words that are unique enough to match exactly one location.
+Use a short, distinctive phrase for `anchor_text` — a few words that are unique enough to match exactly one location. The server maps the matched text to its document range and sends a Docs API `insertComment` request; callers never deal with character indices.
 
 ```
 docs_add_comment(
   doc_id="...",
   anchor_text="unable to perform the Employee's duties",
-  comment="Legal risk: 3-month absence threshold may not satisfy Equality Act 2010 duty to make reasonable adjustments before terminating.",
-  bookmark_jump=true
+  comment="Legal risk: 3-month absence threshold may not satisfy Equality Act 2010 duty to make reasonable adjustments before terminating."
 )
 ```
-
-> **Note:** The current implementation uses Drive comments plus a Docs named range. In the Docs UI these still show as *"Original content deleted"* rather than as proper inline highlights. The comments are fully readable via `docs_read_comments` and the Docs 💬 panel.
->
-> When `bookmark_jump=true`, the tool additionally uses Apps Script automation to create a bookmark at the anchor text and appends a `#bookmark=id...` jump URL into the comment body. This requires the `GOOGLE_DOCS_MCP_APPS_SCRIPT_ID` env var and the Apps Script bridge setup documented above.
->
-> A probe helper is included for this workstream:
->
-> ```bash
-> python3 appscript_probe.py inspect-comment-api --doc-id <DOC_ID>
-> ```
->
-> The probe now creates an API-executable deployment automatically. If account-level Apps Script access is still disabled, it stops with the settings-page message. If execution fails with a permission error, the next blocker is the shared standard Google Cloud project requirement documented at <https://developers.google.com/apps-script/guides/cloud-platform-projects>.
 
 ---
 
@@ -372,9 +325,9 @@ List all comments on a document.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `doc_id` | string | required | Google Doc ID |
-| `include_resolved` | bool | `false` | Include resolved/deleted comments |
+| `include_resolved` | bool | `false` | Include resolved comments |
 
-Returns an array of comments with `id`, `content`, `author`, `anchored` (bool), `named_range_id`, `quoted_text`, `resolved`, `deleted`, `created`.
+Returns `count` and `comments`, each with `id`, `content`, `author`, `quoted_text` (the document text it is anchored to), `assignee`, `resolved`, `created` and `replies`.
 
 ```
 docs_read_comments(doc_id="...")
@@ -402,13 +355,13 @@ docs_reply_to_comment(
 ---
 
 #### `docs_resolve_comment(doc_id, comment_id, reply)`
-Resolve (close) a comment, optionally posting a final reply first.
+Resolve (close) a comment, optionally with a final reply.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `doc_id` | string | required | Google Doc ID |
 | `comment_id` | string | required | Comment ID |
-| `reply` | string | `""` | Optional reply to post before resolving |
+| `reply` | string | `""` | Optional reply posted with the resolution |
 
 ```
 docs_resolve_comment(
@@ -421,7 +374,7 @@ docs_resolve_comment(
 ---
 
 #### `docs_delete_comment(doc_id, comment_id)`
-Permanently delete a comment.
+Permanently delete a comment. Only the comment's author can delete it.
 
 ```
 docs_delete_comment(doc_id="...", comment_id="AAAB1iPyaUY")
@@ -463,7 +416,6 @@ docs_delete_comment(doc_id="...", comment_id="AAAB1iPyaUY")
 | `GOOGLE_DOCS_MCP_TOKEN` | Path to token file (preferred for standalone use) |
 | `GOOGLE_DOCS_MCP_CLIENT_ID` | Optional OAuth client ID override |
 | `GOOGLE_DOCS_MCP_CLIENT_SECRET` | Optional OAuth client secret override |
-| `GOOGLE_DOCS_MCP_APPS_SCRIPT_ID` | Apps Script bridge project ID for `bookmark_jump=true` |
 | `GOOGLE_DOCS_TOKEN_FILE` | Legacy alias |
 | `GOG_KEYRING_PASSWORD` | Auto-export from gog CLI (for personal/OpenClaw use) |
 
@@ -478,12 +430,9 @@ The auth setup requests these scopes:
 | Scope | Purpose |
 |-------|---------|
 | `https://www.googleapis.com/auth/documents` | Read and write Google Docs |
-| `https://www.googleapis.com/auth/drive` | Access Drive files and comments |
+| `https://www.googleapis.com/auth/drive` | Access Drive files (PDF reading, listing docs) |
 | `https://www.googleapis.com/auth/drive.readonly` | Read Drive file metadata |
 | `https://www.googleapis.com/auth/drive.file` | Per-file Drive access |
-| `https://www.googleapis.com/auth/script.projects` | Create Apps Script projects for comment-path experiments |
-| `https://www.googleapis.com/auth/script.deployments` | Deploy Apps Script functions |
-| `https://www.googleapis.com/auth/script.processes` | View script execution |
 | `openid`, `email`, `profile` | Identity |
 
 ---

@@ -266,29 +266,13 @@ def docs_add_comment(
     comment: str,
     anchor_text: str,
     occurrence: int = 1,
-    include_anchor_text: bool = True,
-    bookmark_jump: bool = False,
+    assignee_email: str = "",
 ) -> str:
     """
     Add a comment anchored to specific text in a Google Doc.
 
-    NOTE: The current implementation uses the Drive comments API plus a Docs
-    named range. In the Docs UI this still shows as "Original content deleted"
-    rather than a proper inline comment highlight. The comments ARE readable via
-    docs_read_comments and the Docs 💬 panel.
-
-    The next path to investigate is Apps Script automation. The OAuth token must
-    include the script.* scopes, and the Google account must also have the Apps
-    Script API enabled at https://script.google.com/home/usersettings before
-    remote Apps Script project creation/execution will work.
-
-    By default the tool also appends the matched anchor text into the comment
-    body so the user can understand what was targeted even though the Docs UI
-    does not render a proper inline highlight with the current API path.
-
-    When bookmark_jump=True, the tool also uses a persistent Apps Script bridge
-    (configured via GOOGLE_DOCS_MCP_APPS_SCRIPT_ID) to create a bookmark at the
-    target text, then appends a #bookmark jump URL into the comment body.
+    The comment appears in the Docs UI as a normal inline highlight on the
+    matched text, exactly like a comment a person added.
 
     Args:
         doc_id:      Google Doc ID (from the URL: /document/d/{DOC_ID}/edit)
@@ -297,22 +281,18 @@ def docs_add_comment(
                      Use a short, unique phrase (a few words) for reliable matching.
         occurrence:  Which occurrence of anchor_text to use (default 1 = first).
                      Use 2, 3, etc. if the text appears multiple times.
-        include_anchor_text: If True (default), append the matched anchor text
-                     excerpt into the comment body for human readability.
-        bookmark_jump: If True, create an Apps Script bookmark and append a
-                     jump URL into the comment body. Requires the Apps Script
-                     bridge env var setup documented in the README.
+        assignee_email: Optional email of a user to assign the comment to as an
+                     action item (they are notified by Google Docs).
 
     Returns:
-        JSON with: ok, comment_id, anchored_to (matched text), at_index, named_range_id
+        JSON with: ok, comment_id, anchored_to (matched text), at_index
     """
     result = docs_edit.add_comment(
         doc_id,
         comment,
         anchor_text,
         occurrence,
-        include_anchor_text=include_anchor_text,
-        bookmark_jump=bookmark_jump,
+        assignee_email=assignee_email or None,
     )
     return json.dumps(result, indent=2)
 
@@ -330,21 +310,7 @@ def docs_reply_to_comment(doc_id: str, comment_id: str, reply: str) -> str:
     Returns:
         JSON with: ok, reply_id, comment_id, content
     """
-    from googleapiclient.discovery import build
-    creds = docs_edit._load_creds()
-    drive = build("drive", "v3", credentials=creds)
-    result = drive.replies().create(
-        fileId=doc_id,
-        commentId=comment_id,
-        body={"content": reply},
-        fields="id,content,createdTime",
-    ).execute()
-    return json.dumps({
-        "ok": True,
-        "reply_id": result.get("id"),
-        "comment_id": comment_id,
-        "content": result.get("content"),
-    }, indent=2)
+    return json.dumps(docs_edit.reply_to_comment(doc_id, comment_id, reply), indent=2)
 
 
 @mcp.tool
@@ -355,36 +321,18 @@ def docs_resolve_comment(doc_id: str, comment_id: str, reply: str = "") -> str:
     Args:
         doc_id:     Google Doc ID
         comment_id: ID of the comment to resolve (from docs_read_comments)
-        reply:      Optional reply text to post before resolving
+        reply:      Optional reply text to post with the resolution
 
     Returns:
         JSON with: ok, comment_id, resolved
     """
-    from googleapiclient.discovery import build
-    creds = docs_edit._load_creds()
-    drive = build("drive", "v3", credentials=creds)
-
-    if reply:
-        drive.replies().create(
-            fileId=doc_id,
-            commentId=comment_id,
-            body={"content": reply},
-            fields="id",
-        ).execute()
-
-    drive.comments().update(
-        fileId=doc_id,
-        commentId=comment_id,
-        body={"resolved": True},
-        fields="id,resolved",
-    ).execute()
-    return json.dumps({"ok": True, "comment_id": comment_id, "resolved": True}, indent=2)
+    return json.dumps(docs_edit.resolve_comment(doc_id, comment_id, reply), indent=2)
 
 
 @mcp.tool
 def docs_delete_comment(doc_id: str, comment_id: str) -> str:
     """
-    Delete a comment from a Google Doc.
+    Delete a comment from a Google Doc. Only the comment's author can delete it.
 
     Args:
         doc_id:     Google Doc ID
@@ -393,11 +341,7 @@ def docs_delete_comment(doc_id: str, comment_id: str) -> str:
     Returns:
         JSON with: ok, comment_id
     """
-    from googleapiclient.discovery import build
-    creds = docs_edit._load_creds()
-    drive = build("drive", "v3", credentials=creds)
-    drive.comments().delete(fileId=doc_id, commentId=comment_id).execute()
-    return json.dumps({"ok": True, "comment_id": comment_id}, indent=2)
+    return json.dumps(docs_edit.delete_comment(doc_id, comment_id), indent=2)
 
 
 @mcp.tool
@@ -405,57 +349,18 @@ def docs_read_comments(doc_id: str, include_resolved: bool = False) -> str:
     """
     Read all comments on a Google Doc.
 
-    Returns each comment with its content, author, anchor status, and whether
-    it's resolved or deleted. Useful for auditing what comments exist and
-    whether they are properly anchored to text.
+    Returns each comment thread with its content, author, the document text it
+    is anchored to, any assignee, its replies, and whether it's resolved.
 
     Args:
         doc_id:           Google Doc ID
-        include_resolved: Include resolved/deleted comments (default False)
+        include_resolved: Include resolved comments (default False)
 
     Returns:
-        JSON array of comments with id, content, author, anchored, resolved, deleted,
-        anchored_to (the named range id if anchored), created_time
+        JSON with count and comments: id, content, author, quoted_text, assignee,
+        resolved, created, replies (id, author, content, created)
     """
-    from googleapiclient.discovery import build
-    import json as _json
-
-    creds = docs_edit._load_creds()
-    drive = build("drive", "v3", credentials=creds)
-
-    resp = drive.comments().list(
-        fileId=doc_id,
-        fields="comments(id,content,anchor,resolved,deleted,author,createdTime,quotedFileContent)",
-        pageSize=100,
-    ).execute()
-
-    results = []
-    for c in resp.get("comments", []):
-        if not include_resolved and (c.get("deleted") or c.get("resolved")):
-            continue
-        anchor = c.get("anchor") or ""
-        named_range_id = None
-        if anchor:
-            try:
-                a = _json.loads(anchor)
-                for part in a.get("a", []):
-                    if part.get("t") == "r":
-                        named_range_id = part.get("v")
-            except Exception:
-                pass
-        results.append({
-            "id": c["id"],
-            "content": c.get("content", ""),
-            "author": c.get("author", {}).get("displayName", "?"),
-            "anchored": bool(anchor),
-            "named_range_id": named_range_id,
-            "quoted_text": (c.get("quotedFileContent") or {}).get("value", ""),
-            "resolved": c.get("resolved", False),
-            "deleted": c.get("deleted", False),
-            "created": c.get("createdTime", ""),
-        })
-
-    return json.dumps({"count": len(results), "comments": results}, indent=2)
+    return json.dumps(docs_edit.read_comments(doc_id, include_resolved), indent=2)
 
 
 @mcp.tool
