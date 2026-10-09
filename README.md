@@ -8,6 +8,8 @@ Compatibility note: the repo, package, CLI, env vars, and default token path now
 
 Indexing note: when the MCP reads document content before planning index-based edits, it requests `suggestionsViewMode=SUGGESTIONS_INLINE`. That keeps returned indices aligned for later `documents.batchUpdate` calls when the doc contains suggestions.
 
+Non-Docs note: the Docs API rejects any Drive file that is not a Google Doc with a bare 400 `Request contains an invalid argument`. The MCP then asks Drive what the file is. `docs_get` downloads a PDF (up to 20 MB) and returns its extracted text with a read-only `warning`; every other tool, and `docs_get` for other types such as `.docx`, fails with a message naming the file and its type.
+
 ## Why
 
 The Google Docs API uses **character indices** for every edit. LLMs are bad at counting characters. Everyone ends up deleting and rewriting entire documents, which destroys version history, comments, and collaborator attribution.

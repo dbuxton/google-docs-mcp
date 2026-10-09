@@ -207,6 +207,30 @@ def _get_service(api: str = "docs", version: str = "v1"):
 
 
 SUGGESTIONS_VIEW_MODE = "SUGGESTIONS_INLINE"
+GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
+PDF_MIME_TYPE = "application/pdf"
+MAX_PDF_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+
+class NotAGoogleDocError(RuntimeError):
+    """The ID belongs to a Drive file the Docs API cannot open (PDF, .docx, Sheet...)."""
+
+    def __init__(self, doc_id: str, name: str, mime_type: str, size: int | None):
+        self.doc_id = doc_id
+        self.name = name
+        self.mime_type = mime_type
+        self.size = size
+        if mime_type == PDF_MIME_TYPE:
+            message = (
+                f'"{name}" is a PDF, not a Google Doc, so it cannot be edited or commented on '
+                "with these tools. docs_get can read its text."
+            )
+        else:
+            message = (
+                f'"{name}" is a {mime_type} file, not a Google Doc, so these tools cannot '
+                "read, edit or comment on it."
+            )
+        super().__init__(message)
 
 
 def _get_document(service, doc_id: str) -> dict:
@@ -214,10 +238,66 @@ def _get_document(service, doc_id: str) -> dict:
     Fetch a document with inline suggestions so returned indices stay usable
     for later batchUpdate calls.
     """
-    return service.documents().get(
-        documentId=doc_id,
-        suggestionsViewMode=SUGGESTIONS_VIEW_MODE,
+    from googleapiclient.errors import HttpError
+
+    try:
+        return service.documents().get(
+            documentId=doc_id,
+            suggestionsViewMode=SUGGESTIONS_VIEW_MODE,
+        ).execute()
+    except HttpError as e:
+        # The Docs API answers any non-Docs file with a bare 400 "Request contains an
+        # invalid argument", so ask Drive what the file actually is.
+        if e.resp.status != 400:
+            raise
+        drive_file = _get_service("drive", "v3").files().get(
+            fileId=doc_id,
+            fields="name,mimeType,size",
+            supportsAllDrives=True,
+        ).execute()
+        if drive_file["mimeType"] == GOOGLE_DOC_MIME_TYPE:
+            raise
+        size = drive_file.get("size")
+        raise NotAGoogleDocError(
+            doc_id,
+            drive_file["name"],
+            drive_file["mimeType"],
+            int(size) if size else None,
+        ) from None
+
+
+def _read_pdf(pdf: NotAGoogleDocError) -> dict:
+    """Download a PDF from Drive and return its extracted text in get()'s shape."""
+    import io
+
+    from pypdf import PdfReader
+
+    if pdf.size and pdf.size > MAX_PDF_DOWNLOAD_BYTES:
+        raise RuntimeError(
+            f'"{pdf.name}" is a PDF, not a Google Doc, and is too large to read '
+            f"({pdf.size // (1024 * 1024)} MB; limit {MAX_PDF_DOWNLOAD_BYTES // (1024 * 1024)} MB)."
+        )
+    data = _get_service("drive", "v3").files().get_media(
+        fileId=pdf.doc_id,
+        supportsAllDrives=True,
     ).execute()
+    pages = [(page.extract_text() or "").strip() for page in PdfReader(io.BytesIO(data)).pages]
+    plain_text = "\n\n".join(page for page in pages if page)
+    warning = (
+        "This file is a PDF, not a Google Doc. The text below was extracted from a downloaded "
+        "copy and is read-only: the docs_* editing and comment tools cannot change it, and "
+        "layout such as tables and columns may not survive extraction."
+    )
+    if not plain_text:
+        warning += " No text could be extracted; the PDF is probably a scanned image."
+    return {
+        "title": pdf.name,
+        "mime_type": PDF_MIME_TYPE,
+        "warning": warning,
+        "page_count": len(pages),
+        "paragraphs": [],
+        "plain_text": plain_text,
+    }
 
 
 def _refresh_access_token_stdlib() -> str:
@@ -694,9 +774,17 @@ def get(doc_id: str) -> dict:
           ],
           "plain_text": "full document text..."
         }
+
+    A PDF stored in Drive is returned as extracted, read-only text in the same
+    shape, with no paragraphs plus "mime_type", "page_count" and a "warning".
     """
     service = _get_service("docs", "v1")
-    doc = _get_document(service, doc_id)
+    try:
+        doc = _get_document(service, doc_id)
+    except NotAGoogleDocError as e:
+        if e.mime_type != PDF_MIME_TYPE:
+            raise
+        return _read_pdf(e)
     paragraphs = _extract_paragraphs(doc)
     return {
         "title": doc.get("title", ""),

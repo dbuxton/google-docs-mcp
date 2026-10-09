@@ -95,8 +95,12 @@ def docs_get(doc_id: str) -> str:
     Returns title, list of paragraphs (with text, style, start/end indices),
     and the full plain text. Use this before editing to understand the document.
 
+    A PDF stored in Drive is also readable: its extracted text comes back in
+    plain_text with a "warning" that it is a read-only PDF, not a Google Doc.
+
     Args:
-        doc_id: Google Doc ID (from the URL: /document/d/{DOC_ID}/edit)
+        doc_id: Google Doc ID (from the URL: /document/d/{DOC_ID}/edit) or a
+                Drive file ID of a PDF
     """
     result = docs_edit.get(doc_id)
     return json.dumps(result, indent=2)
