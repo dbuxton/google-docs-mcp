@@ -156,6 +156,11 @@ class CommentTest(unittest.TestCase):
         }
         self.batch_update = self.docs.documents().batchUpdate
         self.drive = mock.MagicMock()
+        # read_comments asks Drive what the file is before choosing where its comments live.
+        self.drive.files.return_value.get.return_value.execute.return_value = {
+            "name": "Contract",
+            "mimeType": docs_edit.GOOGLE_DOC_MIME_TYPE,
+        }
         services = {"docs": self.docs, "drive": self.drive}
         patcher = mock.patch.object(
             docs_edit, "_get_service", side_effect=lambda api, version: services[api]
