@@ -156,6 +156,8 @@ Read a Google Doc and return its full structure.
 
 Returns the document title, a list of paragraphs (with text, heading style, and character indices), and the full plain text. Use this first to understand the document before making edits.
 
+Each paragraph also reports formatting when it is not the default, so you can spot structural problems: `list` (`id`, nesting `level`, `type` of `bullet` or `numbered`), `alignment`, `indent_start` (points) and `formats` (inline styles present: `bold`, `italic`, `underline`, `strikethrough`, `link`).
+
 ```
 docs_get(doc_id="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms")
 ```
@@ -292,6 +294,78 @@ Each item in the array:
 | `regex` | bool | `false` | Regex mode |
 
 ---
+
+### Formatting repair
+
+For documents whose structure has gone wrong — bullets on every paragraph, numbered lists that came out as bullets, headings that are plain text, stray bold or links. Both tools take a JSON list of operations, apply them atomically in one `batchUpdate`, never expose character indices, and support `dry_run` to preview the matches.
+
+#### `docs_format_paragraphs(doc_id, operations_json, dry_run)`
+Set list, heading style, alignment and spacing on many paragraphs at once.
+
+```
+docs_format_paragraphs(
+  doc_id="...",
+  operations_json='[
+    {"match_regex": ".", "list": "none", "style": "NORMAL_TEXT"},
+    {"from": "Introduction", "style": "HEADING_1"},
+    {"from": "Open the file", "to": "Save and close", "list": "numbered"},
+    {"from": "Kind regards", "alignment": "left", "reset_indent": true}
+  ]'
+)
+```
+
+Selection (anchors are case-insensitive substrings):
+
+| Field | Description |
+|-------|-------------|
+| `from` | First paragraph containing this text. On its own it selects just that paragraph. |
+| `to` | Last paragraph of the range, inclusive (first match at or after `from`) |
+| `match_regex` | Only paragraphs whose text matches. `from`/`to` then just limit the scope (default: whole document). `"."` skips empty paragraphs; `"^"` includes them. |
+
+Changes (at least one):
+
+| Field | Description |
+|-------|-------------|
+| `style` | `NORMAL_TEXT`, `TITLE`, `SUBTITLE`, `HEADING_1`…`HEADING_6` (also `"H2"`, `"heading 2"`) |
+| `list` | `"none"` removes bullets/numbering **and** the leftover indent; `"bullet"`; `"numbered"`; or a Docs preset such as `NUMBERED_UPPERALPHA_ALPHA_ROMAN` |
+| `alignment` | `left`, `center`, `right`, `justified` |
+| `reset_indent` | `true` to zero the paragraph indents |
+| `space_above`, `space_below` | Points |
+| `line_spacing` | Percent (`100` = single) |
+| `clear_text_formatting` | `true` to reset bold/italic/underline/colour/size/font/link on the text |
+
+Operations apply in order against one snapshot of the document; where several select the same paragraph, the later one wins. Consecutive paragraphs given the same `list` value become **one** list (numbering continues); separate groups restart at 1.
+
+---
+
+#### `docs_format_text(doc_id, operations_json, dry_run)`
+Character-level formatting on matched text or whole paragraphs.
+
+```
+docs_format_text(
+  doc_id="...",
+  operations_json='[
+    {"from": "Summary", "to": "Next steps", "clear": true},
+    {"find": "Note:", "occurrence": 0, "bold": true, "color": "#B00020"},
+    {"find": "old-link-text", "link": ""}
+  ]'
+)
+```
+
+| Field | Description |
+|-------|-------------|
+| `find`, `regex`, `occurrence` | Text (or regex) to format; `1` = first (default), `0` = all |
+| `from`, `to` | With `find`: limit it to a paragraph range. Without `find`: format those paragraphs' whole text |
+| `match_regex` | Without `find`: whole paragraphs whose text matches |
+| `bold`, `italic`, `underline`, `strikethrough` | `true` / `false` |
+| `font_family`, `font_size` | e.g. `"Arial"`, `11` (points) |
+| `color`, `background` | `"#RRGGBB"` text / highlight colour |
+| `link` | URL to set, or `""` to remove a link |
+| `clear` | `true` to first reset all of the above to the paragraph style's defaults |
+
+---
+
+### Creating documents
 
 #### `docs_create(title, initial_text)`
 Create a new Google Doc.

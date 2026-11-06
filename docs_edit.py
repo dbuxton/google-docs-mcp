@@ -43,7 +43,7 @@ Python API:
                           list_suggestions, review_suggestions, convert_to_google_doc,
                           add_comment,
                           read_comments, reply_to_comment, resolve_comment,
-                          delete_comment
+                          delete_comment, format_paragraphs, format_text
 """
 
 from __future__ import annotations
@@ -370,6 +370,12 @@ class Paragraph:
     cell: Optional[tuple[int, int, int]] = None  # (table, row, column) inside a table cell
     keeps_newline: bool = False  # Docs won't delete its closing newline (see _walk_paragraphs)
     suggestion_ids: list[str] = field(default_factory=list)  # Suggestions that touch it
+    list_id: Optional[str] = None       # Set when the paragraph is a list item
+    nesting_level: int = 0
+    list_type: Optional[str] = None     # "bullet" or "numbered"
+    alignment: Optional[str] = None     # None means the default (START)
+    indent_start: float = 0
+    formats: list[str] = field(default_factory=list)  # Inline styles present: bold, italic, ...
 
 
 @dataclass
@@ -430,6 +436,20 @@ def _add_ids(ids: list[str], *sources) -> None:
                 ids.append(suggestion_id)
 
 
+_INLINE_FORMATS = ("bold", "italic", "underline", "strikethrough")
+
+
+def _list_type(doc: dict, list_id: str, level: int) -> str:
+    """Classify a list level as "numbered" (glyphType) or "bullet" (glyphSymbol)."""
+    levels = (
+        doc.get("lists", {}).get(list_id, {}).get("listProperties", {}).get("nestingLevels", [])
+    )
+    glyph_type = levels[level].get("glyphType") if level < len(levels) else None
+    if glyph_type and glyph_type not in ("NONE", "GLYPH_TYPE_UNSPECIFIED"):
+        return "numbered"
+    return "bullet"
+
+
 def _extract_paragraphs(doc: dict) -> list[Paragraph]:
     """
     Extract paragraphs with full structure from a Docs API response, including the
@@ -442,9 +462,11 @@ def _extract_paragraphs(doc: dict) -> list[Paragraph]:
     paragraphs = []
     for elem, cell, keeps_newline in _walk_paragraphs(doc.get("body", {}).get("content", [])):
         para = elem["paragraph"]
-        style = para.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
+        paragraph_style = para.get("paragraphStyle", {})
+        style = paragraph_style.get("namedStyleType", "NORMAL_TEXT")
         runs = []
         suggestion_ids: list[str] = []
+        formats: set[str] = set()
         for pe in para.get("elements", []):
             if "textRun" not in pe:
                 # An image, footnote, page break...: each carries its own suggestion IDs.
@@ -469,6 +491,11 @@ def _extract_paragraphs(doc: dict) -> list[Paragraph]:
                 text_run.get("suggestedDeletionIds"),
                 text_run.get("suggestedTextStyleChanges"),
             )
+            if text_run["content"].strip() and not text_run.get("suggestedDeletionIds"):
+                text_style = text_run.get("textStyle", {})
+                formats.update(f for f in _INLINE_FORMATS if text_style.get(f))
+                if text_style.get("link"):
+                    formats.add("link")
         _add_ids(
             suggestion_ids,
             para.get("suggestedParagraphStyleChanges"),
@@ -476,6 +503,7 @@ def _extract_paragraphs(doc: dict) -> list[Paragraph]:
         )
         # Strip trailing newline for display (Google Docs always ends paragraphs with \n)
         display_text = "".join(run.text for run in runs if run.live).rstrip("\n")
+        bullet = para.get("bullet")
         paragraphs.append(Paragraph(
             text=display_text,
             style=style,
@@ -485,6 +513,17 @@ def _extract_paragraphs(doc: dict) -> list[Paragraph]:
             cell=cell,
             keeps_newline=keeps_newline,
             suggestion_ids=suggestion_ids,
+            list_id=bullet["listId"] if bullet else None,
+            nesting_level=bullet.get("nestingLevel", 0) if bullet else 0,
+            list_type=(
+                _list_type(doc, bullet["listId"], bullet.get("nestingLevel", 0)) if bullet else None
+            ),
+            alignment=(
+                paragraph_style.get("alignment")
+                if paragraph_style.get("alignment") not in (None, "START") else None
+            ),
+            indent_start=paragraph_style.get("indentStart", {}).get("magnitude", 0),
+            formats=sorted(formats),
         ))
     return paragraphs
 
@@ -873,7 +912,7 @@ def get(doc_id: str) -> dict:
     items = []
     suggestion_ids: list[str] = []
     for p in paragraphs:
-        item: dict = {"text": p.text, "style": p.style, "start": p.start, "end": p.end}
+        item = _describe_paragraph(p)
         if p.cell:
             table, row, column = p.cell
             item["table_cell"] = {"table": table, "row": row, "column": column}
@@ -894,6 +933,20 @@ def get(doc_id: str) -> dict:
             "each suggestion changes."
         )
     return result
+
+
+def _describe_paragraph(p: Paragraph) -> dict:
+    """A paragraph as docs_get reports it; formatting keys appear only when non-default."""
+    out: dict = {"text": p.text, "style": p.style, "start": p.start, "end": p.end}
+    if p.list_id:
+        out["list"] = {"id": p.list_id, "level": p.nesting_level, "type": p.list_type}
+    if p.alignment:
+        out["alignment"] = p.alignment
+    if p.indent_start:
+        out["indent_start"] = p.indent_start
+    if p.formats:
+        out["formats"] = p.formats
+    return out
 
 
 def search_replace(
@@ -1302,6 +1355,486 @@ def _docs_or_drive(
         if not_a_doc is None:
             raise
     return via_drive(not_a_doc)
+
+
+# ---------------------------------------------------------------------------
+# Formatting: paragraph-level and character-level repair tools
+# ---------------------------------------------------------------------------
+
+_SELECTION_KEYS = {"from", "to", "match_regex"}
+_PARAGRAPH_CHANGE_KEYS = {
+    "style", "list", "alignment", "reset_indent",
+    "space_above", "space_below", "line_spacing", "clear_text_formatting",
+}
+_TEXT_CHANGE_KEYS = {
+    "bold", "italic", "underline", "strikethrough", "font_family", "font_size",
+    "color", "background", "link", "clear",
+}
+_NAMED_STYLES = (
+    "NORMAL_TEXT", "TITLE", "SUBTITLE",
+    "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6",
+)
+_NAMED_STYLE_ALIASES = {"NORMAL": "NORMAL_TEXT", "BODY": "NORMAL_TEXT", "PARAGRAPH": "NORMAL_TEXT"}
+_ALIGNMENTS = {
+    "left": "START", "start": "START", "center": "CENTER", "centre": "CENTER",
+    "right": "END", "end": "END", "justify": "JUSTIFIED", "justified": "JUSTIFIED",
+}
+_LIST_PRESETS = {
+    "bullet": "BULLET_DISC_CIRCLE_SQUARE",
+    "bullets": "BULLET_DISC_CIRCLE_SQUARE",
+    "numbered": "NUMBERED_DECIMAL_NESTED",
+    "numbers": "NUMBERED_DECIMAL_NESTED",
+}
+_NO_LIST = "NONE"
+# Every text attribute that "clear" resets to the style's default.
+_CLEARABLE_TEXT_FIELDS = (
+    "bold,italic,underline,strikethrough,smallCaps,baselineOffset,"
+    "fontSize,foregroundColor,backgroundColor,weightedFontFamily,link"
+)
+
+
+def _check_operations(operations, allowed: set[str], what: str) -> list[dict]:
+    if not isinstance(operations, list) or not operations:
+        raise ValueError(f"{what}: operations must be a non-empty list of objects.")
+    for n, op in enumerate(operations, 1):
+        if not isinstance(op, dict):
+            raise ValueError(f"Operation {n}: must be an object, got {type(op).__name__}.")
+        unknown = sorted(set(op) - allowed)
+        if unknown:
+            raise ValueError(
+                f"Operation {n}: unknown field(s) {unknown}. Allowed: {sorted(allowed)}."
+            )
+    return operations
+
+
+def _normalize_named_style(value) -> str:
+    key = re.sub(r"[\s\-]+", "_", str(value).strip().upper())
+    heading = re.fullmatch(r"H(?:EADING)?_?([1-6])", key)
+    if heading:
+        key = f"HEADING_{heading.group(1)}"
+    key = _NAMED_STYLE_ALIASES.get(key, key)
+    if key not in _NAMED_STYLES:
+        raise ValueError(f"Unknown style {value!r}. Use one of: {', '.join(_NAMED_STYLES)}.")
+    return key
+
+
+def _normalize_list(value) -> str:
+    """Return a Docs bullet preset, or _NO_LIST to remove list formatting."""
+    key = str(value).strip().lower()
+    if key in ("none", "off", "remove", "no"):
+        return _NO_LIST
+    if key in _LIST_PRESETS:
+        return _LIST_PRESETS[key]
+    if re.fullmatch(r"(bullet|numbered|checkbox)_[a-z_]+", key):
+        return key.upper()
+    raise ValueError(
+        f"Unknown list value {value!r}. Use 'none', 'bullet', 'numbered', "
+        "or a Docs preset such as NUMBERED_UPPERALPHA_ALPHA_ROMAN."
+    )
+
+
+def _points(value, name: str) -> dict:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{name} must be a non-negative number of points, got {value!r}.")
+    return {"magnitude": value, "unit": "PT"}
+
+
+def _parse_paragraph_changes(n: int, op: dict) -> dict:
+    changes: dict = {}
+    if op.get("style") is not None:
+        changes["style"] = _normalize_named_style(op["style"])
+    if op.get("list") is not None:
+        changes["list"] = _normalize_list(op["list"])
+    if op.get("alignment") is not None:
+        alignment = _ALIGNMENTS.get(str(op["alignment"]).strip().lower())
+        if not alignment:
+            raise ValueError(
+                f"Unknown alignment {op['alignment']!r}. Use left, center, right or justified."
+            )
+        changes["alignment"] = alignment
+    if op.get("reset_indent"):
+        changes["reset_indent"] = True
+    for key in ("space_above", "space_below"):
+        if op.get(key) is not None:
+            changes[key] = _points(op[key], key)
+    if op.get("line_spacing") is not None:
+        spacing = op["line_spacing"]
+        if isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or spacing <= 0:
+            raise ValueError("line_spacing must be a positive percentage (100 = single).")
+        changes["line_spacing"] = spacing
+    if op.get("clear_text_formatting"):
+        changes["clear_text_formatting"] = True
+    if not changes:
+        raise ValueError(
+            f"Operation {n}: nothing to change. Set at least one of "
+            f"{sorted(_PARAGRAPH_CHANGE_KEYS)}."
+        )
+    return changes
+
+
+def _find_paragraph(paragraphs: list[Paragraph], anchor: str, start: int, label: str) -> int:
+    needle = anchor.lower()
+    for i in range(start, len(paragraphs)):
+        if needle in paragraphs[i].text.lower():
+            return i
+    raise ValueError(f"No paragraph containing {label} anchor: {anchor!r}")
+
+
+def _paragraph_bounds(
+    paragraphs: list[Paragraph], op: dict, n: int, *, scoped: bool
+) -> tuple[int, int]:
+    """
+    Resolve `from`/`to` into inclusive paragraph indices.
+
+    With scoped=True some other filter (match_regex or find) picks the content,
+    so a missing end defaults to the start/end of the document. With
+    scoped=False, `from` alone means just that one paragraph.
+    """
+    start_anchor, end_anchor = op.get("from"), op.get("to")
+    if not start_anchor and not end_anchor and not scoped:
+        raise ValueError(f"Operation {n}: select paragraphs with 'from' (and optionally 'to').")
+    if end_anchor and not start_anchor and not scoped:
+        raise ValueError(f"Operation {n}: 'to' needs 'from'.")
+    low, high = 0, len(paragraphs) - 1
+    if start_anchor:
+        low = _find_paragraph(paragraphs, start_anchor, 0, "'from'")
+        if not end_anchor and not scoped:
+            high = low
+    if end_anchor:
+        high = _find_paragraph(paragraphs, end_anchor, low, "'to'")
+    return low, high
+
+
+def _select_paragraphs(paragraphs: list[Paragraph], op: dict, n: int) -> list[int]:
+    pattern = op.get("match_regex")
+    low, high = _paragraph_bounds(paragraphs, op, n, scoped=bool(pattern))
+    indices = list(range(low, high + 1))
+    if pattern:
+        try:
+            regex = re.compile(pattern)
+        except re.error as e:
+            raise ValueError(f"Operation {n}: invalid match_regex {pattern!r}: {e}") from None
+        indices = [i for i in indices if regex.search(paragraphs[i].text)]
+    if not indices:
+        raise ValueError(f"Operation {n}: no paragraphs matched.")
+    return indices
+
+
+def _paragraph_format_requests(
+    paragraphs: list[Paragraph], specs: dict[int, dict]
+) -> list[dict]:
+    """Turn merged per-paragraph specs into one ordered, index-safe request list."""
+    # Group neighbouring paragraphs with identical specs (and nothing between them, such as
+    # a table) so a list stays one list and numbering is continuous within the group.
+    groups: list[list[int]] = []
+    for i in sorted(specs):
+        if (
+            groups
+            and groups[-1][-1] == i - 1
+            and specs[i] == specs[i - 1]
+            and paragraphs[i].start == paragraphs[i - 1].end
+        ):
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+
+    edits: list[dict] = []
+    bullets: list[tuple[int, dict]] = []
+    for group in groups:
+        spec = specs[group[0]]
+        span = {"startIndex": paragraphs[group[0]].start, "endIndex": paragraphs[group[-1]].end}
+
+        if spec.get("list") == _NO_LIST:
+            run: list[int] = []
+            for i in group + [None]:
+                if i is not None and paragraphs[i].list_id:
+                    run.append(i)
+                    continue
+                if run:
+                    edits.append({"deleteParagraphBullets": {"range": {
+                        "startIndex": paragraphs[run[0]].start,
+                        "endIndex": paragraphs[run[-1]].end,
+                    }}})
+                    run = []
+
+        style: dict = {}
+        fields: list[str] = []
+        if "style" in spec:
+            style["namedStyleType"] = spec["style"]
+            fields.append("namedStyleType")
+        if "alignment" in spec:
+            style["alignment"] = spec["alignment"]
+            fields.append("alignment")
+        for key, api_name in (("space_above", "spaceAbove"), ("space_below", "spaceBelow")):
+            if key in spec:
+                style[api_name] = spec[key]
+                fields.append(api_name)
+        if "line_spacing" in spec:
+            style["lineSpacing"] = spec["line_spacing"]
+            fields.append("lineSpacing")
+        if spec.get("reset_indent") or spec.get("list") == _NO_LIST:
+            # deleteParagraphBullets keeps the list's visual indent as real indent; zero it.
+            style["indentStart"] = {"magnitude": 0, "unit": "PT"}
+            style["indentFirstLine"] = {"magnitude": 0, "unit": "PT"}
+            fields += ["indentStart", "indentFirstLine"]
+        if fields:
+            edits.append({"updateParagraphStyle": {
+                "range": dict(span), "paragraphStyle": style, "fields": ",".join(fields),
+            }})
+
+        if spec.get("clear_text_formatting"):
+            edits.append({"updateTextStyle": {
+                "range": dict(span), "textStyle": {}, "fields": _CLEARABLE_TEXT_FIELDS,
+            }})
+
+        if spec.get("list") not in (None, _NO_LIST):
+            bullets.append((span["startIndex"], {"createParagraphBullets": {
+                "range": dict(span), "bulletPreset": spec["list"],
+            }}))
+
+    # createParagraphBullets strips leading tabs (nesting), which shifts later indices,
+    # so run it last and from the end of the document backwards.
+    bullets.sort(key=lambda item: item[0], reverse=True)
+    return edits + [request for _, request in bullets]
+
+
+def _describe_for_preview(p: Paragraph) -> dict:
+    out = {"text": p.text[:80], "style": p.style}
+    if p.list_id:
+        out["list"] = p.list_type
+    return out
+
+
+def format_paragraphs(doc_id: str, operations: list[dict], dry_run: bool = False) -> dict:
+    """
+    Repair or set paragraph-level formatting in one atomic batchUpdate.
+
+    Each operation selects paragraphs and says what to change:
+
+      Selection (no character indices):
+        from         anchor text; the first paragraph containing it (case-insensitive)
+        to           anchor text; last paragraph of the range, inclusive (first match at or
+                     after `from`)
+        match_regex  only paragraphs whose text matches this regex (re.search). With it,
+                     `from`/`to` just limit the scope (default: whole document).
+
+      Changes (at least one):
+        style                 NORMAL_TEXT | TITLE | SUBTITLE | HEADING_1..6 (also "H2", "heading 2")
+        list                  "none" removes bullets/numbering (and the leftover indent),
+                              "bullet", "numbered", or a Docs preset name
+        alignment             left | center | right | justified
+        reset_indent          zero the paragraph indents
+        space_above/space_below   points
+        line_spacing          percent (100 = single)
+        clear_text_formatting reset bold/italic/underline/colour/size/font/link on the text
+
+    Operations apply in order against one snapshot of the document; when several
+    select the same paragraph, later operations override earlier ones. Consecutive
+    paragraphs given the same list value become ONE list (continuous numbering).
+    """
+    operations = _check_operations(
+        operations, _SELECTION_KEYS | _PARAGRAPH_CHANGE_KEYS, "format_paragraphs"
+    )
+    service = _get_service("docs", "v1")
+    doc = _get_document(service, doc_id)
+    paragraphs = _extract_paragraphs(doc)
+    if not paragraphs:
+        raise ValueError("Document has no paragraphs.")
+
+    specs: dict[int, dict] = {}
+    report = []
+    for n, op in enumerate(operations, 1):
+        changes = _parse_paragraph_changes(n, op)
+        selected = _select_paragraphs(paragraphs, op, n)
+        for i in selected:
+            specs.setdefault(i, {}).update(changes)
+        report.append({
+            "operation": n,
+            "matched": len(selected),
+            "preview": [_describe_for_preview(paragraphs[i]) for i in selected[:5]],
+        })
+
+    requests = _paragraph_format_requests(paragraphs, specs)
+    if requests and not dry_run:
+        service.documents().batchUpdate(
+            documentId=doc_id, body={"requests": requests}
+        ).execute()
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "paragraphs_changed": len(specs),
+        "requests": len(requests),
+        "operations": report,
+    }
+
+
+def _parse_hex_color(value, name: str) -> dict:
+    match = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(value).strip())
+    if not match:
+        raise ValueError(f"{name} must be a hex colour like #FF0000, got {value!r}.")
+    rgb = bytes.fromhex(match.group(1))
+    return {"color": {"rgbColor": {
+        "red": rgb[0] / 255, "green": rgb[1] / 255, "blue": rgb[2] / 255,
+    }}}
+
+
+def _parse_text_style(n: int, op: dict) -> tuple[bool, dict, list[str]]:
+    """Return (clear_first, textStyle, fields) for a format_text operation."""
+    clear = bool(op.get("clear"))
+    style: dict = {}
+    fields: list[str] = []
+    for key in _INLINE_FORMATS:
+        if op.get(key) is not None:
+            if not isinstance(op[key], bool):
+                raise ValueError(f"Operation {n}: {key} must be true or false, got {op[key]!r}.")
+            style[key] = op[key]
+            fields.append(key)
+    if op.get("font_family"):
+        style["weightedFontFamily"] = {"fontFamily": str(op["font_family"])}
+        fields.append("weightedFontFamily")
+    if op.get("font_size") is not None:
+        style["fontSize"] = _points(op["font_size"], "font_size")
+        fields.append("fontSize")
+    if op.get("color") is not None:
+        style["foregroundColor"] = _parse_hex_color(op["color"], "color")
+        fields.append("foregroundColor")
+    if op.get("background") is not None:
+        style["backgroundColor"] = _parse_hex_color(op["background"], "background")
+        fields.append("backgroundColor")
+    if op.get("link") is not None:
+        if op["link"]:
+            style["link"] = {"url": str(op["link"])}
+        fields.append("link")  # listed without a value, it removes the link
+    if not clear and not fields:
+        raise ValueError(
+            f"Operation {n}: nothing to change. Set at least one of {sorted(_TEXT_CHANGE_KEYS)}."
+        )
+    return clear, style, fields
+
+
+def _full_text_range_to_doc_ranges(
+    start: int, end: int, text_map: list[tuple[int, int, str]]
+) -> list[tuple[int, int]]:
+    """Map a full_text span to document ranges (UTF-16 indices), merging contiguous runs."""
+    ranges: list[tuple[int, int]] = []
+    for offset, doc_start, text in text_map:
+        low, high = max(start, offset), min(end, offset + len(text))
+        if low >= high:
+            continue
+        piece = (
+            doc_start + _utf16_len(text[: low - offset]),
+            doc_start + _utf16_len(text[: high - offset]),
+        )
+        if ranges and ranges[-1][1] == piece[0]:
+            ranges[-1] = (ranges[-1][0], piece[1])
+        else:
+            ranges.append(piece)
+    return ranges
+
+
+def format_text(doc_id: str, operations: list[dict], dry_run: bool = False) -> dict:
+    """
+    Apply character-level formatting to matched text, in one atomic batchUpdate.
+
+    Each operation selects text either by content or by whole paragraphs:
+
+      find         literal text (or a regex with "regex": true) to format
+      occurrence   which match: 1 = first (default), 2 = second, 0 = all
+      from / to    limit `find` to a paragraph range (anchor text, inclusive); without
+                   `find`, format the whole text of the paragraphs from `from` through `to`
+                   (or just `from`)
+      match_regex  without `find`: whole paragraphs whose text matches this regex
+
+    Changes (at least one):
+      bold, italic, underline, strikethrough   true / false
+      font_family ("Arial"), font_size (points), color / background ("#RRGGBB")
+      link         a URL to set, or "" to remove a link
+      clear        first reset all of the above to the paragraph style's defaults
+
+    Operations apply in order, so later ones win where they overlap.
+    """
+    operations = _check_operations(
+        operations,
+        _SELECTION_KEYS | _TEXT_CHANGE_KEYS | {"find", "occurrence", "regex"},
+        "format_text",
+    )
+    service = _get_service("docs", "v1")
+    doc = _get_document(service, doc_id)
+    paragraphs = _extract_paragraphs(doc)
+    if not paragraphs:
+        raise ValueError("Document has no paragraphs.")
+    full_text, text_map = _build_full_text_map(paragraphs)
+    bounds: list[tuple[int, int]] = []  # each paragraph's span within full_text
+    position = 0
+    for p in paragraphs:
+        length = sum(len(r.text) for r in p.runs if r.live)
+        bounds.append((position, position + length))
+        position += length
+
+    requests: list[dict] = []
+    report = []
+    for n, op in enumerate(operations, 1):
+        clear, style, fields = _parse_text_style(n, op)
+        spans: list[tuple[int, int]] = []  # full_text spans to format
+
+        if op.get("find") is not None:
+            find = op["find"]
+            if not find:
+                raise ValueError(f"Operation {n}: find must not be empty.")
+            if op.get("match_regex") is not None:
+                raise ValueError(f"Operation {n}: use either find or match_regex, not both.")
+            low, high = _paragraph_bounds(paragraphs, op, n, scoped=True)
+            try:
+                regex = re.compile(find if op.get("regex") else re.escape(find))
+            except re.error as e:
+                raise ValueError(f"Operation {n}: invalid regex {find!r}: {e}") from None
+            matches = [
+                m.span() for m in regex.finditer(full_text, bounds[low][0], bounds[high][1])
+                if m.end() > m.start()
+            ]
+            if not matches:
+                raise ValueError(f"Operation {n}: text not found: {find!r}")
+            occurrence = op.get("occurrence", 1)
+            if occurrence == 0:
+                spans = matches
+            elif isinstance(occurrence, int) and 1 <= occurrence <= len(matches):
+                spans = [matches[occurrence - 1]]
+            else:
+                raise ValueError(
+                    f"Operation {n}: occurrence {occurrence!r} not found "
+                    f"({len(matches)} match(es) for {find!r})."
+                )
+        else:
+            for i in _select_paragraphs(paragraphs, op, n):
+                low_pos, high_pos = bounds[i]
+                # Leave the paragraph's own newline out of the span.
+                if full_text[low_pos:high_pos].endswith("\n"):
+                    high_pos -= 1
+                if high_pos > low_pos:
+                    spans.append((low_pos, high_pos))
+            if not spans:
+                raise ValueError(f"Operation {n}: the selected paragraphs have no text.")
+
+        previews = []
+        for start, end in spans:
+            previews.append(full_text[start:end][:80])
+            for doc_start, doc_end in _full_text_range_to_doc_ranges(start, end, text_map):
+                span = {"startIndex": doc_start, "endIndex": doc_end}
+                if clear:
+                    requests.append({"updateTextStyle": {
+                        "range": dict(span), "textStyle": {}, "fields": _CLEARABLE_TEXT_FIELDS,
+                    }})
+                if fields:
+                    requests.append({"updateTextStyle": {
+                        "range": dict(span), "textStyle": style, "fields": ",".join(fields),
+                    }})
+        report.append({"operation": n, "matched": len(spans), "preview": previews[:5]})
+
+    if requests and not dry_run:
+        service.documents().batchUpdate(
+            documentId=doc_id, body={"requests": requests}
+        ).execute()
+    return {"ok": True, "dry_run": dry_run, "requests": len(requests), "operations": report}
 
 
 def add_comment(
@@ -2115,6 +2648,16 @@ def _build_parser() -> argparse.ArgumentParser:
     cv.add_argument("file_id")
     cv.add_argument("--name", default="", help="Title for the copy (default: the original's name)")
 
+    # format_paragraphs / format_text
+    for name, help_text in (
+        ("format_paragraphs", "Fix lists, heading styles, alignment, spacing"),
+        ("format_text", "Fix bold/italic/colour/links on matched text"),
+    ):
+        fp = sub.add_parser(name, help=help_text)
+        fp.add_argument("doc_id")
+        fp.add_argument("--operations", required=True, help="JSON array of operations")
+        fp.add_argument("--dry-run", action="store_true", help="Preview without editing")
+
     # add_comment
     ac = sub.add_parser("add_comment", help="Add a comment anchored to specific text")
     ac.add_argument("doc_id")
@@ -2165,6 +2708,10 @@ def main():
             result = review_suggestions(args.doc_id, args.action, args.ids)
         elif args.command == "convert":
             result = convert_to_google_doc(args.file_id, args.name)
+        elif args.command == "format_paragraphs":
+            result = format_paragraphs(args.doc_id, json.loads(args.operations), args.dry_run)
+        elif args.command == "format_text":
+            result = format_text(args.doc_id, json.loads(args.operations), args.dry_run)
         elif args.command == "add_comment":
             result = add_comment(
                 args.doc_id,

@@ -15,6 +15,7 @@ Tools:
             docs_insert_before, docs_delete_paragraph, docs_append,
             docs_batch_replace
   Suggestions: docs_list_suggestions, docs_review_suggestions
+  Format:   docs_format_paragraphs, docs_format_text
   Comments: docs_add_comment, docs_read_comments, docs_reply_to_comment,
             docs_resolve_comment, docs_delete_comment
   Manage:   docs_list, docs_create
@@ -78,6 +79,9 @@ TOOLS, with their exact parameter names (name=value is the default):
     docs_reply_to_comment(doc_id, comment_id, reply)
     docs_resolve_comment(doc_id, comment_id, reply="")
     docs_delete_comment(doc_id, comment_id)
+  Formatting — fix structure that has gone wrong; JSON list of operations, atomic, dry_run to preview
+    docs_format_paragraphs(doc_id, operations_json, dry_run=False)   lists, heading styles, alignment, spacing
+    docs_format_text(doc_id, operations_json, dry_run=False)         bold/italic/underline, font, colour, links
   Documents
     docs_create(title, initial_text="")
     docs_convert_to_google_doc(file_id, name="")   Google Doc copy of a Word/RTF/text/HTML/PDF file
@@ -92,11 +96,19 @@ SUGGESTIONS vs EDITS:
   what each suggestion changes; docs_review_suggestions accepts/rejects/deletes them.
   Suggestions appear as made by the signed-in Google account.
 
+FIXING FORMATTING (lists, headings, alignment, bold/links) — for structure that has gone wrong:
+  docs_get shows each paragraph's list (id, level, bullet/numbered), alignment, indent_start and
+  inline formats. Then repair it with docs_format_paragraphs / docs_format_text, which take a JSON
+  list of operations, apply them atomically, select by anchor text or regex, and support
+  dry_run=True to preview. They edit directly (they cannot be suggestions).
+
 TYPICAL WORKFLOW:
   1. docs_get — read the document
   2. docs_search_replace / docs_insert_after / etc. — make targeted edits
   3. docs_get — verify changes
   For redlining: the same edits with suggest=True → docs_list_suggestions
+  To fix messy formatting: docs_get → docs_format_paragraphs / docs_format_text
+  (dry_run first for large changes) → docs_get.
   For review: docs_add_comment → docs_read_comments → docs_resolve_comment
 
 WORD FILES AND PDFS (not Google Docs): only real Google Docs can be edited or given suggestions.
@@ -316,6 +328,122 @@ def docs_batch_replace(doc_id: str, replacements_json: str, suggest: bool = Fals
     """
     replacements = json.loads(replacements_json)
     result = docs_edit.batch_replace(doc_id, replacements, suggest=suggest)
+    return json.dumps(result, indent=2)
+
+
+def _load_operations(operations_json: str) -> list:
+    operations = json.loads(operations_json)
+    return [operations] if isinstance(operations, dict) else operations
+
+
+@mcp.tool
+def docs_format_paragraphs(
+    doc_id: str,
+    operations_json: str,
+    dry_run: bool = False,
+) -> str:
+    """
+    Repair or set paragraph formatting (lists, heading styles, alignment, spacing)
+    for many paragraphs at once, atomically in one API call.
+
+    Use this when a document's structure is wrong: bullets applied to every
+    paragraph, numbered lists that came out as bullets, headings that are plain
+    text, stray indents. Call docs_get first — each paragraph reports its
+    "list" (id, level, bullet/numbered), "alignment", "indent_start" and inline
+    "formats" — then fix it here. Use dry_run=true to preview the matches.
+
+    Each operation selects paragraphs, then says what to change:
+
+      Selection (anchors are case-insensitive substrings; never character indices):
+        from          first paragraph containing this text
+        to            last paragraph of the range (inclusive), first match at/after `from`
+        match_regex   only paragraphs whose text matches this regex. With it,
+                      from/to merely limit the scope (default: whole document).
+                      Empty paragraphs never match "." — use "^" to include them.
+        A `from` alone (no match_regex) selects just that one paragraph.
+
+      Changes (at least one):
+        style                   NORMAL_TEXT, TITLE, SUBTITLE, HEADING_1..HEADING_6
+                                (also "H2", "heading 2")
+        list                    "none" strips bullets/numbering AND the leftover indent;
+                                "bullet"; "numbered"; or a Docs preset such as
+                                NUMBERED_UPPERALPHA_ALPHA_ROMAN
+        alignment               left | center | right | justified
+        reset_indent            true to zero the paragraph indents
+        space_above / space_below   points
+        line_spacing            percent (100 = single)
+        clear_text_formatting   true to reset bold/italic/underline/colour/size/font/link
+
+    Operations apply in order against one snapshot; where several select the same
+    paragraph, the later one wins. So "clear everything, then re-apply" works:
+      [{"match_regex": ".", "list": "none", "style": "NORMAL_TEXT"},
+       {"from": "Introduction", "style": "HEADING_1"},
+       {"from": "First step", "to": "Last step", "list": "numbered"}]
+    Consecutive paragraphs given the same `list` value become ONE list (numbering
+    continues); separate groups restart at 1.
+
+    Args:
+        doc_id:          Google Doc ID
+        operations_json: JSON array of operations (a single object is also accepted)
+        dry_run:         If true, report what would change without editing
+
+    Returns:
+        JSON with: ok, dry_run, paragraphs_changed, requests, operations
+        (per operation: matched count and a preview of the first matches)
+    """
+    result = docs_edit.format_paragraphs(doc_id, _load_operations(operations_json), dry_run)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool
+def docs_format_text(
+    doc_id: str,
+    operations_json: str,
+    dry_run: bool = False,
+) -> str:
+    """
+    Apply character-level formatting (bold, italic, underline, strikethrough, font,
+    size, colour, highlight, links) to matched text, atomically in one API call.
+
+    Use this to fix or add inline styling that docs_search_replace and the
+    markdown-style rich insert cannot reach: un-bold a whole section, restyle
+    every "Note:" label, remove stray links, reset text that picked up odd
+    formatting. Use dry_run=true to preview the matches.
+
+    Each operation selects text, then says what to change:
+
+      Selection — either by content:
+        find          literal text (or a regex with "regex": true)
+        occurrence    1 = first match (default), 2 = second, 0 = all matches
+        from / to     optionally limit `find` to a paragraph range (anchor text,
+                      inclusive); `from` alone means "from there to the end"
+      — or by whole paragraphs (omit `find`):
+        from / to     paragraphs from `from` through `to` (or just `from`)
+        match_regex   only paragraphs whose text matches this regex
+
+      Changes (at least one):
+        bold, italic, underline, strikethrough   true or false
+        font_family   e.g. "Arial"
+        font_size     points
+        color         text colour as "#RRGGBB"
+        background    highlight colour as "#RRGGBB"
+        link          a URL to set, or "" to remove an existing link
+        clear         true to first reset all of the above to the style's defaults
+
+    Operations apply in order, so later ones win where they overlap. Example:
+      [{"from": "Summary", "to": "Next steps", "clear": true},
+       {"find": "Note:", "occurrence": 0, "bold": true, "color": "#B00020"}]
+
+    Args:
+        doc_id:          Google Doc ID
+        operations_json: JSON array of operations (a single object is also accepted)
+        dry_run:         If true, report what would change without editing
+
+    Returns:
+        JSON with: ok, dry_run, requests, operations
+        (per operation: matched count and a preview of the first matches)
+    """
+    result = docs_edit.format_text(doc_id, _load_operations(operations_json), dry_run)
     return json.dumps(result, indent=2)
 
 
