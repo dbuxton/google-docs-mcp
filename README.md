@@ -376,6 +376,25 @@ docs_create(title="Q2 Board Deck", initial_text="Confidential — not for distri
 
 Returns `{id, title, webViewLink}`.
 
+#### `docs_copy(doc_id, name, folder_id)`
+Duplicate a document, like **File → Make a copy**. Use it to start from a template or an earlier version: copy it, then edit the copy by its returned `id`. The original is never touched.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `doc_id` | string | required | Drive file ID of the doc to copy (from its URL) |
+| `name` | string | `""` | Title for the copy (default: `Copy of <original's title>`, as Drive names it) |
+| `folder_id` | string | `""` | Drive folder ID for the copy (default: beside the original) |
+
+```
+docs_copy(doc_id="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms", name="Acme Order Form")
+```
+
+Returns `ok`, `id` (the copy), `name`, `webViewLink`, `copied_from` (`id`, `name`, `type`) and a `note`.
+
+- Content and formatting come across. Comments may not (Drive's copy follows Make a copy), so check with `docs_read_comments` if they matter.
+- It copies any Drive file, not only Google Docs: a `.docx` or PDF is copied as it is, **not** converted (use `docs_convert_to_google_doc` for that). A folder is refused.
+- It needs the `drive` scope, which the auth setup already requests.
+
 ---
 
 ### Suggestions

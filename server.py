@@ -18,7 +18,7 @@ Tools:
   Format:   docs_format_paragraphs, docs_format_text
   Comments: docs_add_comment, docs_read_comments, docs_reply_to_comment,
             docs_resolve_comment, docs_delete_comment
-  Manage:   docs_list, docs_create
+  Manage:   docs_list, docs_create, docs_copy
 
 Auth (in priority order):
   1. GOOGLE_DOCS_MCP_TOKEN env var   — standalone token (auth_setup.py)
@@ -84,6 +84,7 @@ TOOLS, with their exact parameter names (name=value is the default):
     docs_format_text(doc_id, operations_json, dry_run=False)         bold/italic/underline, font, colour, links
   Documents
     docs_create(title, initial_text="")
+    docs_copy(doc_id, name="", folder_id="")   Duplicate a doc (or any Drive file): fill in a template
     docs_convert_to_google_doc(file_id, name="")   Google Doc copy of a Word/RTF/text/HTML/PDF file
 
 SUGGESTIONS vs EDITS:
@@ -101,6 +102,9 @@ FIXING FORMATTING (lists, headings, alignment, bold/links) — for structure tha
   inline formats. Then repair it with docs_format_paragraphs / docs_format_text, which take a JSON
   list of operations, apply them atomically, select by anchor text or regex, and support
   dry_run=True to preview. They edit directly (they cannot be suggestions).
+
+FILLING IN A TEMPLATE: docs_copy the template, then edit the copy by its returned id (never the
+original). Edits apply to the copy only, so one template can serve any number of documents.
 
 TYPICAL WORKFLOW:
   1. docs_get — read the document
@@ -678,6 +682,29 @@ def docs_create(title: str, initial_text: str = "") -> str:
         "title": title,
         "webViewLink": f"https://docs.google.com/document/d/{doc_id}/edit",
     }, indent=2)
+
+
+@mcp.tool
+def docs_copy(doc_id: str, name: str = "", folder_id: str = "") -> str:
+    """
+    Duplicate a document: the same as File > Make a copy in Google Docs.
+
+    Use this to start from a template or a previous version without touching it: copy it,
+    then edit the copy with the other docs_* tools using the returned id. The copy keeps
+    all content and formatting; comments may not come across (check with docs_read_comments).
+    It works on any Drive file (a
+    Word file or PDF is copied as it is, not converted: see docs_convert_to_google_doc).
+
+    Args:
+        doc_id:    Google Doc ID (or other Drive file ID) to copy
+        name:      Title for the copy (default: "Copy of <original's title>")
+        folder_id: Drive folder ID to put the copy in (default: beside the original)
+
+    Returns:
+        JSON with: ok, id (the copy: use it from now on), name, webViewLink,
+        copied_from (id, name, type) and a note
+    """
+    return json.dumps(docs_edit.copy_doc(doc_id, name, folder_id), indent=2)
 
 
 @mcp.tool

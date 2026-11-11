@@ -2562,6 +2562,66 @@ def convert_to_google_doc(file_id: str, name: str = "") -> dict:
     }
 
 
+FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+
+
+def copy_doc(doc_id: str, name: str = "", folder_id: str = "") -> dict:
+    """
+    Duplicate a file in Drive: the same as File > Make a copy, but without the dialog.
+
+    Works for a Google Doc (the usual case: filling in a template), and equally for a
+    Word file or PDF, which is copied as it is, not converted (see convert_to_google_doc).
+    The original is never touched. Comments on the original may not come across: check
+    the copy with read_comments if they matter.
+
+    Args:
+        doc_id:    Drive file ID of the file to copy
+        name:      Title for the copy (default: "Copy of <original's name>", as Drive names it)
+        folder_id: Drive folder ID to put the copy in (default: beside the original)
+
+    Returns:
+        {"ok": True, "id": "<new file id>", "name": "...", "webViewLink": "...",
+         "copied_from": {"id", "name", "type"}, "note": "..."}
+    """
+    drive = _get_service("drive", "v3")
+    source = drive.files().get(
+        fileId=doc_id, fields="id,name,mimeType", supportsAllDrives=True
+    ).execute()
+    mime_type = source["mimeType"]
+    kind = (
+        "a Google Doc" if mime_type == GOOGLE_DOC_MIME_TYPE
+        else FILE_TYPE_NAMES.get(mime_type, f"a file of type {mime_type}")
+    )
+    if mime_type == FOLDER_MIME_TYPE:
+        raise ValueError(f'"{source["name"]}" is a folder, and Drive cannot copy folders.')
+
+    body: dict = {"name": name or f'Copy of {source["name"]}'}
+    if folder_id:
+        body["parents"] = [folder_id]
+    copy = drive.files().copy(
+        fileId=doc_id,
+        body=body,
+        supportsAllDrives=True,
+        fields="id,name,webViewLink",
+    ).execute()
+
+    if folder_id:
+        where = "in the folder you named"
+    else:
+        where = "beside the original"
+    return {
+        "ok": True,
+        "id": copy["id"],
+        "name": copy["name"],
+        "webViewLink": copy.get("webViewLink") or f"https://docs.google.com/document/d/{copy['id']}/edit",
+        "copied_from": {"id": doc_id, "name": source["name"], "type": kind},
+        "note": (
+            f"The copy is {where}; the original is unchanged. Comments may not be copied: check with docs_read_comments. "
+            "Use the returned id with the other docs_* tools."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------

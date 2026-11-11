@@ -198,5 +198,26 @@ class ConvertToolTest(unittest.TestCase):
                 call_tool("docs_convert_to_google_doc", file_id="sheet")
 
 
+class CopyToolTest(unittest.TestCase):
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def test_the_tool_needs_only_a_doc_id(self):
+        schema = schema_of(list_tools()["docs_copy"])
+
+        self.assertEqual(schema["required"], ["doc_id"])
+        self.assertEqual(list(schema["properties"]), ["doc_id", "name", "folder_id"])
+
+    def test_arguments_reach_docs_edit_and_the_result_comes_back_as_json(self):
+        reply = {"ok": True, "id": "new"}
+        with mock.patch.object(docs_edit, "copy_doc", return_value=reply) as copy:
+            result = call_tool("docs_copy", doc_id="t1", name="Acme order form", folder_id="f9")
+            call_tool("docs_copy", doc_id="t2")
+
+        self.assertEqual(copy.call_args_list, [mock.call("t1", "Acme order form", "f9"), mock.call("t2", "", "")])
+        self.assertEqual(result_json(result), reply)
+
+
 if __name__ == "__main__":
     unittest.main()
