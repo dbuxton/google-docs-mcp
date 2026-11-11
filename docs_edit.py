@@ -3,13 +3,16 @@
 docs_edit.py — Surgical Google Docs editor
 ==========================================
 Edits Google Docs in-place using real batchUpdate requests, preserving
-document history, comments, and suggestions. LLMs never touch indices.
+document history, comments, and suggestions. Text edits use anchors; raw API
+tools expose indices for structural operations the anchor tools do not cover.
 
 Every edit command takes --suggest to record the change as a suggestion (like
 Docs' Suggesting mode) for someone to accept or reject, instead of editing the text.
 
 Usage (CLI):
     docs_edit.py get <docId>
+    docs_edit.py get_raw <docId> [--fields "tabs"]
+    docs_edit.py advanced_edit <docId> --requests '[{"createHeader":{"type":"DEFAULT"}}]' --required-revision-id REV [--dry-run] [--suggest]
     docs_edit.py search_replace <docId> --find "old" --replace "new" [--occurrence 1] [--regex] [--suggest]
     docs_edit.py insert_after <docId> --anchor "paragraph text" --text "new text" [--plain] [--suggest]
     docs_edit.py insert_before <docId> --anchor "paragraph text" --text "new text" [--plain] [--suggest]
@@ -38,7 +41,8 @@ Auth (in priority order):
 Legacy GOOGLE_DRIVE_MCP_* env var aliases still work.
 
 Python API:
-    from docs_edit import get, search_replace, insert_after, insert_before,
+    from docs_edit import get, get_raw, advanced_edit,
+                          search_replace, insert_after, insert_before,
                           delete_paragraph, append, batch_replace,
                           list_suggestions, review_suggestions, convert_to_google_doc,
                           add_comment,
@@ -799,7 +803,24 @@ class EmbeddedCommentError(RuntimeError):
     """The comment is saved inside a Word file, which neither the Docs nor the Drive API can change."""
 
 
-def _batch_update(service, doc_id: str, requests: list[dict], suggest: bool = False) -> dict:
+def _batch_update_body(
+    requests: list[dict], suggest: bool = False, required_revision_id: str = ""
+) -> dict:
+    body: dict = {"requests": requests}
+    write_control = {}
+    if required_revision_id:
+        write_control["requiredRevisionId"] = required_revision_id
+    if suggest:
+        write_control["writeMode"] = WRITE_MODE_SUGGEST
+    if write_control:
+        body["writeControl"] = write_control
+    return body
+
+
+def _batch_update(
+    service, doc_id: str, requests: list[dict], suggest: bool = False,
+    *, required_revision_id: str = "",
+) -> dict:
     """
     Send one atomic batchUpdate. With suggest=True the Docs API records every request
     as a suggestion for a person to accept or reject, instead of editing the text.
@@ -809,9 +830,7 @@ def _batch_update(service, doc_id: str, requests: list[dict], suggest: bool = Fa
     """
     from googleapiclient.errors import HttpError
 
-    body: dict = {"requests": requests}
-    if suggest:
-        body["writeControl"] = {"writeMode": WRITE_MODE_SUGGEST}
+    body = _batch_update_body(requests, suggest, required_revision_id)
     try:
         return service.documents().batchUpdate(documentId=doc_id, body=body).execute()
     except HttpError as e:
@@ -857,7 +876,8 @@ def _suggestion_fields(
     removed = _suggestion_ids(result, "deletedSuggestionIds")
     # An edit that inserts text always creates or updates a suggestion; one that only
     # deletes may instead take text out of a pending suggestion, leaving nothing new.
-    only_deletes = all("deleteContentRange" in request for request in requests)
+    deletion_types = {"deleteContentRange", "deleteTableRow", "deleteTableColumn", "deletePositionedObject"}
+    only_deletes = all(deletion_types.intersection(request) for request in requests)
     saved = created or updated or (removed if only_deletes else [])
     state = result.get("commentUpdateState", "")
     if state == "ALL_FAILED_UNKNOWN_REASON" or (expect_changes and not saved):
@@ -878,6 +898,54 @@ def _suggestion_fields(
 # ---------------------------------------------------------------------------
 # Core operations
 # ---------------------------------------------------------------------------
+
+def get_raw(doc_id: str, fields: str = "") -> dict:
+    """Return the Docs API JSON, including all tabs and inline suggestion indices.
+
+    A partial-response field mask can limit large documents. Always request the
+    document ID and revision ID alongside it so a later raw write can be guarded.
+    Unlike get(), this does not flatten content or fall back to PDF extraction.
+    """
+    params: dict = {"includeTabsContent": True}
+    if fields.strip():
+        params["fields"] = f"documentId,revisionId,{fields.strip()}"
+    return _get_document(_get_service("docs", "v1"), doc_id, **params)
+
+
+def advanced_edit(
+    doc_id: str, requests: list[dict], required_revision_id: str,
+    suggest: bool = False, dry_run: bool = False,
+) -> dict:
+    """Send native Docs requests unchanged, guarded by a revision from get_raw().
+
+    Validate only the request envelope locally: Google validates request names,
+    payloads and document constraints. Do not maintain a request-type allowlist,
+    so new API operations work without adding another MCP wrapper. A dry run
+    previews the body only; it does not ask Google to validate it.
+    """
+    if not isinstance(requests, list) or not requests:
+        raise ValueError("requests must be a non-empty JSON array of Docs API Request objects.")
+    for i, request in enumerate(requests):
+        if not isinstance(request, dict) or len(request) != 1:
+            raise ValueError(f"requests[{i}] must contain exactly one request type.")
+        name, payload = next(iter(request.items()))
+        if not isinstance(name, str) or not name.strip() or not isinstance(payload, dict):
+            raise ValueError(f"requests[{i}] must map a request type to a JSON object.")
+    if not isinstance(required_revision_id, str) or not required_revision_id.strip():
+        raise ValueError("required_revision_id must be the revisionId returned by docs_get_raw.")
+
+    result: dict = {"ok": True, "dry_run": dry_run, "request_count": len(requests)}
+    if dry_run:
+        result["body"] = _batch_update_body(requests, suggest, required_revision_id)
+        result["note"] = "Preview only: request payloads and revision have not been validated by Google."
+        return result
+
+    response = _batch_update(
+        _get_service("docs", "v1"), doc_id, requests, suggest,
+        required_revision_id=required_revision_id,
+    )
+    return {"response": response, **result, **_suggestion_fields(response, suggest, requests)}
+
 
 def get(doc_id: str) -> dict:
     """
@@ -2628,7 +2696,7 @@ def copy_doc(doc_id: str, name: str = "", folder_id: str = "") -> dict:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Surgical Google Docs editor — LLMs never touch indices.",
+        description="Surgical Google Docs editor — text anchors and native structural edits.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--json", action="store_true", help="Output JSON (default for scripting)")
@@ -2640,6 +2708,18 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("doc_id")
 
     suggest_help = "Record the change as a suggestion instead of editing the text"
+
+    # Native structure and API requests
+    gr = sub.add_parser("get_raw", help="Get native Docs JSON, including all tabs and revisionId")
+    gr.add_argument("doc_id")
+    gr.add_argument("--fields", default="", help="Optional Google partial-response field mask")
+
+    bu = sub.add_parser("advanced_edit", help="Edit document structure using native Docs API requests")
+    bu.add_argument("doc_id")
+    bu.add_argument("--requests", required=True, help="JSON array of native Request objects")
+    bu.add_argument("--required-revision-id", required=True, help="revisionId from get_raw")
+    bu.add_argument("--suggest", action="store_true", help=suggest_help)
+    bu.add_argument("--dry-run", action="store_true", help="Preview the body without writing")
 
     # search_replace
     sr = sub.add_parser("search_replace", help="Search and replace text")
@@ -2742,6 +2822,13 @@ def main():
     try:
         if args.command == "get":
             result = get(args.doc_id)
+        elif args.command == "get_raw":
+            result = get_raw(args.doc_id, args.fields)
+        elif args.command == "advanced_edit":
+            result = advanced_edit(
+                args.doc_id, json.loads(args.requests), args.required_revision_id,
+                suggest=args.suggest, dry_run=args.dry_run,
+            )
         elif args.command == "search_replace":
             result = search_replace(
                 args.doc_id, args.find, args.replace, args.occurrence, args.regex,

@@ -1,6 +1,6 @@
 # google-docs-mcp
 
-> Surgical Google Docs editing for AI agents — preserves history, never touches character indices.
+> Surgical Google Docs editing for AI agents — text anchors for common edits, native API access for document structure.
 
 An MCP server that makes Google Docs actually usable for LLMs. **Standalone** — no other tools required beyond a Google Cloud OAuth app.
 
@@ -8,7 +8,7 @@ Compatibility note: the repo, package, CLI, env vars, and default token path now
 
 Indexing note: when the MCP reads document content before planning index-based edits, it requests `suggestionsViewMode=SUGGESTIONS_INLINE`. That keeps returned indices aligned for later `documents.batchUpdate` calls when the doc contains suggestions. Anchor text is matched against the document as it will read once pending suggestions are accepted (suggested deletions are ignored), so an edit can follow a suggestion made earlier.
 
-Tables note: text inside tables is read by `docs_get` and can be matched, edited and commented on like any other text.
+Structural editing note: `docs_get_raw` and `docs_advanced_edit` provide general access to document structures supported by Google's API: headers, footers, images, sections, tabs, tables, rows/columns and more. The tools include guidance for finding elements and constructing the corresponding API requests. Text inside tables can also be read and edited with the usual anchor tools.
 
 Non-Docs note: the Docs API treats a Drive file that is not a Google Doc in two ways. A PDF is refused with a bare 400 `Request contains an invalid argument`, and `docs_get` then downloads it (up to 20 MB) and returns its extracted text with a read-only `warning`. A `.docx` is read without complaint (Docs converts it on the fly) but every write, edits and comments alike, is refused with `The document must not be an Office file`. Either way the MCP asks Drive what the file is: the edit tools fail with a message naming the file and its type, and the comment tools fall back to Drive comments on the file (see [Comments](#comments)).
 
@@ -17,6 +17,8 @@ Non-Docs note: the Docs API treats a Drive file that is not a Google Doc in two 
 The Google Docs API uses **character indices** for every edit. LLMs are bad at counting characters. Everyone ends up deleting and rewriting entire documents, which destroys version history, comments, and collaborator attribution.
 
 This server uses the same abstraction as code editors: **search by text, not by position**. You describe *what* to change; the server finds *where* it is and handles the index arithmetic.
+
+For operations beyond the anchor tools, a raw reader and general advanced-editing tool expose the native Google Docs API. Advanced edits use a revision ID from the document you read, so Google rejects a stale edit instead of silently applying outdated indices.
 
 ---
 
@@ -152,7 +154,7 @@ Token is saved to `~/.google-docs-mcp/token.json` by default. Override with `--o
 ### Document reading
 
 #### `docs_get(doc_id)`
-Read a Google Doc and return its full structure.
+Read a Google Doc and return its paragraphs and text from the first tab's body.
 
 Returns the document title, a list of paragraphs (with text, heading style, and character indices), and the full plain text. Use this first to understand the document before making edits.
 
@@ -178,6 +180,7 @@ Returns:
 
 - **Tables.** Paragraphs inside tables are included in document order; each carries a `table_cell` with its table, row and column (counted from 0).
 - **Pending suggestions.** The text is the document as it will read once every suggestion is accepted (suggested deletions are hidden). Paragraphs a suggestion touches carry `suggestions` (IDs) and the result has `suggestion_ids` and a `note`. `docs_list_suggestions` shows what each one changes.
+- **Other elements and tabs.** Use `docs_get_raw` for native structures, headers/footers, images, sections, or additional tabs.
 
 ---
 
@@ -197,7 +200,7 @@ docs_list(query="board deck 2026", limit=5)
 
 ### Document editing
 
-All editing tools use **text anchors**, never character indices. The server finds the text and handles the indices internally. Text inside tables is found like any other text.
+The text editing tools use **text anchors**, never character indices. The server finds the text and handles the indices internally. Text inside tables is found like any other text. For other document elements, see [Advanced document editing](#advanced-document-editing).
 
 Every editing tool also takes **`suggest`** (default `false`). With `suggest=true` the change is recorded as a suggestion for someone to accept or reject, instead of editing the text. See [Suggestions](#suggestions).
 
@@ -365,6 +368,80 @@ docs_format_text(
 
 ---
 
+### Advanced document editing
+
+One general editing tool covers structural operations. Its MCP description includes the workflow, request examples and element-specific constraints, so agents receive the guidance when they discover the tool.
+
+#### `docs_get_raw(doc_id, fields)`
+
+Return the unmodified [`documents.get` response](https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/get) with `includeTabsContent=true` and `suggestionsViewMode=SUGGESTIONS_INLINE`.
+
+```
+docs_get_raw(doc_id="...")
+# Optional Google partial-response mask for a smaller response:
+docs_get_raw(doc_id="...", fields="title,tabs")
+```
+
+The default returns all document fields the API provides: table structures, headers, footers, footnotes, inline/positioned objects, sections, styles, named ranges and all tabs. Content lives under `tabs[].documentTab`; nested tabs live under `childTabs`. Suggested deletions remain in the native text runs so indices are usable for writes. `fields` defaults to `""` (no mask); when a mask is supplied, `documentId` and `revisionId` are always requested alongside it. Unlike `docs_get`, this reader does not fall back to extracting PDF text.
+
+#### `docs_advanced_edit(doc_id, requests_json, required_revision_id, suggest, dry_run)`
+
+Send any supported native [`documents.batchUpdate` Request](https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request). This covers table insertion, rows/columns, cell merging and styles, headers/footers, images, section and document styles, page breaks, named ranges, tabs, and future request types without adding a wrapper for each one.
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `doc_id` | required | Google Doc ID |
+| `requests_json` | required | Non-empty JSON array of native Request objects; one request type per object |
+| `required_revision_id` | required | `revisionId` from the snapshot used to plan the requests |
+| `suggest` | `false` | Apply as suggestions where Google supports that request type |
+| `dry_run` | `false` | Preview the exact request body; checks the envelope locally, **not** Google payload validity or revision freshness |
+
+For example, after inspecting the raw document and confirming that a header is missing, create a default header on the chosen tab:
+
+```
+docs_advanced_edit(
+  doc_id="...",
+  required_revision_id="<revisionId from docs_get_raw>",
+  requests_json='[{"createHeader":{"type":"DEFAULT","sectionBreakLocation":{"index":0,"tabId":"<tabId from docs_get_raw>"}}}]'
+)
+```
+
+The result contains `ok`, `dry_run`, `request_count`, and `response` with the full Google response, including `replies` (such as the new `headerId`) and `writeControl`. A preview returns `body` instead of `response`. Suggest mode also returns verified suggestion IDs using the same checks as the text tools.
+
+The workflow is **inspect → build requests → preview if useful → edit → read again to verify**. Each target has its own addressing rules:
+
+| Target | Where to inspect in `documentTab` | How to edit |
+|--------|----------------------------------|-------------|
+| Headers, footers, footnotes | `headers`, `footers`, `footnotes` maps; header/footer references in `documentStyle` and each `sectionBreak.sectionStyle` | Text/style requests with `segmentId` and `tabId` on their location/range. `createHeader` / `createFooter` use `type` and `sectionBreakLocation`; read the new ID before adding content. `deleteHeader` / `deleteFooter` take the segment's ID and `tabId`. |
+| Images | `inlineObjects` / `positionedObjects`; paragraph elements reference their IDs | `insertInlineImage` at a paragraph location, `replaceImage` by `imageObjectId`. Delete an inline image's exact range with `deleteContentRange`; a floating image uses `deletePositionedObject`. |
+| Sections and page layout | `body.content[].sectionBreak.sectionStyle`, `documentStyle` | `updateSectionStyle` with a range overlapping the intended sections, or `updateDocumentStyle` for the tab's defaults. Use explicit field masks. `insertSectionBreak` / `insertPageBreak` take body locations. |
+| Tabs | `tabs[].tabProperties`, recursively through `childTabs` | `addDocumentTab`, `updateDocumentTabProperties` (title, position or parent), `deleteTab`. Deleting a tab also deletes its children. |
+| Tables, rows, columns, cells | A table structural element's `startIndex`, `tableRows`, `tableCells`, cell content and spans | `insertTable`, `insertTableRow` / `insertTableColumn`, `deleteTableRow` / `deleteTableColumn`, `mergeTableCells` / `unmergeTableCells`, and table style requests. Use the **table's** start index plus zero-based row/column coordinates. |
+| Named ranges and other elements | `namedRanges`, paragraph elements and their IDs/ranges | The corresponding native Request, such as `createNamedRange` or `replaceNamedRangeContent`; consult the request reference for exact fields. Read-only fields may have no mutation method. |
+
+Once a header exists, for example, append text using its segment ID and the **newly read** revision:
+
+```
+docs_advanced_edit(
+  doc_id="...",
+  required_revision_id="<fresh revisionId>",
+  requests_json='[{"insertText":{"endOfSegmentLocation":{"segmentId":"<headerId>","tabId":"<tabId>"},"text":"Confidential"}}]'
+)
+```
+
+- Copy indices and IDs from a fresh raw read. Indices are UTF-16 offsets local to the tab and segment, so include `tabId` and `segmentId` in the locations/ranges specified by that request's schema. Most requests default to the first tab; some, such as `replaceAllText`, default to all tabs.
+- Requests are passed through in order. Earlier insertions/deletions can shift later indices; re-read after structural changes when the next locations are not known. After creating a header, read again before inserting text into the returned segment.
+- Use narrow style/property `fields` masks such as `"marginLeft"` or `"title"` to avoid resetting unrelated properties. Preserve final body/segment/cell newlines and complete structural boundaries.
+- A header/footer for a later section can inherit from the preceding section; inspect its actual references before editing or deleting it. Image URLs must be accessible to Google, and image replacement can crop to existing bounds. Page-layout requests may require paged mode.
+- Deleting a merged cell's row/column can remove every row/column it spans; deleting the last row/column removes the table. To populate a new table, insert it first, read its new cell indices, then insert text. Text deletion alone leaves the row in place.
+- Google validates requests at execution and rejects invalid batches. If the revision has changed, read again and rebuild the requests; do not retry stale indices with a new revision ID.
+- Google does not support every request in suggest mode. An unsupported request remains an error; the tool never retries as a direct edit. Prefer the dedicated comment and suggestion-review tools for those operations.
+- The raw tools use the existing authentication and Office-file error handling. They do not make API-unsupported operations possible or make a Word/PDF file editable as a Google Doc.
+
+CLI equivalents: `get_raw DOC [--fields MASK]` and `advanced_edit DOC --requests JSON --required-revision-id REV [--suggest] [--dry-run]`.
+
+---
+
 ### Creating documents
 
 #### `docs_create(title, initial_text)`
@@ -417,7 +494,7 @@ Under the hood this sends the same `batchUpdate` requests as a direct edit with 
 - **Which IDs.** `suggestion_ids` are the suggestions the edit created. If it folded into an existing suggestion (which may be someone else's) that is `updated_suggestion_ids`, and if it only deleted text a pending suggestion had inserted, a suggestion it shrank away is `removed_suggestion_ids`. Check `docs_list_suggestions` for the author before accepting an ID you did not create. Google may also split one edit into several suggestions: an insert with a bullet list comes back as the text and, separately, its list formatting, so review all the IDs returned.
 - **Attribution.** Suggestions are authored by the Google account you authenticated with, as if typed in Suggesting mode.
 - **Reading.** `docs_get` shows the document as it will read once all suggestions are accepted, so later anchors quote what a reader sees and one edit can build on another.
-- **Limits.** The Docs API refuses some requests in suggest mode: tab changes, named ranges, header/footer deletion, table column properties and a few document-style fields. The editing tools here use none of them.
+- **Limits.** The Docs API refuses some requests in suggest mode: tab changes, named ranges, header/footer deletion, table column properties and a few document-style fields. The anchor editing tools use none of them; `docs_advanced_edit` exposes them and returns Google's error if they are requested with `suggest=true`.
 - **Not itemised.** Pending changes to tables, images, footnotes, page breaks and the like are listed by `docs_list_suggestions` with Google's summary, and `docs_get` flags the paragraphs that hold them, but their `changes` stay empty.
 
 #### `docs_list_suggestions(doc_id, include_closed)`
