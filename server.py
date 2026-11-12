@@ -6,14 +6,15 @@ Exposes Google Docs and Drive operations as MCP tools.
 
 Core abstraction: search-by-text, not by character index.
 LLMs describe WHAT they want to change; the server figures out WHERE.
-All edits use real batchUpdate — version history, comments, and
-suggestions are preserved. Every edit tool can instead record its change
-as a suggestion (suggest=True) for a person to accept or reject.
+All edits use real batchUpdate — version history is preserved.
+Text edits can instead record their change as a suggestion
+(suggest=True). Raw API tools cover additional structural operations.
 
 Tools:
   Editing:  docs_get, docs_search_replace, docs_insert_after,
             docs_insert_before, docs_delete_paragraph, docs_append,
             docs_batch_replace
+  Advanced: docs_get_raw, docs_advanced_edit
   Suggestions: docs_list_suggestions, docs_review_suggestions
   Format:   docs_format_paragraphs, docs_format_text
   Comments: docs_add_comment, docs_read_comments, docs_reply_to_comment,
@@ -56,12 +57,15 @@ logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 mcp = FastMCP(
     name="google-docs-mcp",
     instructions="""
-Surgical Google Docs editing — search by text, never by character index.
-Text inside tables is read, matched and edited like any other text.
+Surgical Google Docs editing — search by text for common edits.
+Text inside tables is read, matched and edited like any other text. Use the general
+docs_advanced_edit tool for headers/footers, images, sections, tabs, tables and other
+document elements, with docs_get_raw to inspect their native structure first.
 
 TOOLS, with their exact parameter names (name=value is the default):
   Reading
     docs_get(doc_id)                     Document structure: paragraphs + plain text
+    docs_get_raw(doc_id, fields="")      Native Docs JSON: all tabs, elements, IDs, revisionId
     docs_list(query="", limit=20)        Recent docs, optionally filtered
   Editing — each takes suggest=True to propose the change instead of making it
     docs_search_replace(doc_id, find, replace, occurrence=1, regex=False, suggest=False)
@@ -70,6 +74,8 @@ TOOLS, with their exact parameter names (name=value is the default):
     docs_delete_paragraph(doc_id, anchor, suggest=False)
     docs_append(doc_id, text, rich=True, suggest=False)
     docs_batch_replace(doc_id, replacements_json, suggest=False)   atomic, one API call
+  Advanced editing — headers/footers, images, sections, tabs, tables and other structures
+    docs_advanced_edit(doc_id, requests_json, required_revision_id, suggest=False, dry_run=False)
   Suggestions — tracked changes that a person accepts or rejects in Docs
     docs_list_suggestions(doc_id, include_closed=False)
     docs_review_suggestions(doc_id, action, suggestion_ids)   action: accept | reject | delete
@@ -102,6 +108,23 @@ FIXING FORMATTING (lists, headings, alignment, bold/links) — for structure tha
   inline formats. Then repair it with docs_format_paragraphs / docs_format_text, which take a JSON
   list of operations, apply them atomically, select by anchor text or regex, and support
   dry_run=True to preview. They edit directly (they cannot be suggestions).
+
+ADVANCED EDITS:
+  docs_get_raw returns the original API structure, including
+  tables, headers, footers, footnotes, images, sections, named ranges and child tabs.
+  Then docs_advanced_edit sends native Request objects unchanged to Google. Read
+  indices/IDs from that snapshot and pass its revisionId as required_revision_id.
+  Copy tabId/segmentId into each request's appropriate location/range; indices are
+  UTF-16 offsets local to that tab/segment. Requests run in order; earlier edits can
+  shift later indices. Re-read after a structural edit or revision conflict.
+  The tool description includes recipes for headers/footers, images, sections, tabs
+  and tables. Creation replies supply new IDs; read again before editing new elements.
+  Use explicit field masks for style/property updates. Dry_run checks only the
+  request envelope and previews the body; Google validates
+  payloads at execution. suggest=True uses the same confirmation checks as text edits,
+  but Google rejects some request types in suggest mode. Never retry as a direct edit
+  when the user asked for suggestions. Use the dedicated comment tools for comments.
+  Request schemas: https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request
 
 FILLING IN A TEMPLATE: docs_copy the template, then edit the copy by its returned id (never the
 original). Edits apply to the copy only, so one template can serve any number of documents.
@@ -155,6 +178,148 @@ def docs_get(doc_id: str) -> str:
                 Drive file ID of a PDF
     """
     result = docs_edit.get(doc_id)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool
+def docs_get_raw(doc_id: str, fields: str = "") -> str:
+    """
+    Read native Google Docs API JSON for structural edits, including all tabs.
+
+    Exposes tables/cells, headers, footers, footnotes, images, sections, named
+    ranges, styles and nested tabs with their original indices and IDs. Uses
+    SUGGESTIONS_INLINE so indices remain valid for docs_advanced_edit. Unlike
+    docs_get, suggested deletions remain in the returned text runs.
+
+    Find the target using tabProperties.tabId/title (traverse childTabs too).
+    Within documentTab: body.content contains paragraphs, tables and sectionBreaks;
+    headers/footers/footnotes are maps keyed by segment ID; inlineObjects and
+    positionedObjects are maps keyed by object ID. DocumentStyle and sectionStyle
+    identify the headers/footers used by each section. Table rows/cells each have
+    their own content and indices. An omitted startIndex is zero in the API JSON.
+    Use fields="tabs" for all tab content; nested field masks can narrow a large read.
+
+    Args:
+        doc_id: Google Doc ID
+        fields: Optional Google partial-response field mask, e.g. "tabs".
+                documentId and revisionId are always requested alongside it.
+
+    Returns:
+        The unmodified API response. Content is under tabs[].documentTab and
+        recursively under childTabs. Pass revisionId to docs_advanced_edit.
+    """
+    return json.dumps(docs_edit.get_raw(doc_id, fields), indent=2)
+
+
+@mcp.tool
+def docs_advanced_edit(
+    doc_id: str, requests_json: str, required_revision_id: str,
+    suggest: bool = False, dry_run: bool = False,
+) -> str:
+    """
+    Make advanced edits to headers, footers, images, sections, tabs, tables and more.
+
+    Covers inserting/deleting tables, rows and columns, merging cells, table
+    styles, headers/footers, images, sections, page breaks, tabs and any other
+    supported documents.batchUpdate Request. Prefer the anchor tools for common
+    text edits. This is the general structural editing tool; individual element
+    types do not need separate tools.
+
+    Read docs_get_raw first. Use returned UTF-16 indices and IDs; include tabId
+    and segmentId where required by each request. Requests execute in order, so
+    earlier edits may shift later indices. Google rejects the batch if its
+    revision has changed; re-read and rebuild instead of retrying stale indices.
+
+    Workflow: docs_get_raw -> identify the actual element -> optionally dry_run
+    -> docs_advanced_edit -> docs_get_raw to verify. Requests below are independent
+    examples, NOT one batch. Replace TAB_ID, SEGMENT_ID, IMAGE_ID, URLs and numeric
+    indices with values from the current document; never count characters by eye.
+
+    HEADERS / FOOTERS / FOOTNOTES
+      Inspect documentTab.headers/footers/footnotes and documentStyle/sectionStyle
+      header/footer IDs to find the segment actually used by the target section.
+      Check which sections share that ID before changing inherited header/footer text.
+      Edit existing segment text with insertText/deleteContentRange/updateTextStyle,
+      setting segmentId AND tabId on the location/range. Preserve its final newline.
+      Append to an existing segment:
+        {"insertText":{"endOfSegmentLocation":{"segmentId":"SEGMENT_ID","tabId":"TAB_ID"},"text":"Confidential"}}
+      Create a missing header (createFooter has the same shape):
+        {"createHeader":{"type":"DEFAULT","sectionBreakLocation":{"index":0,"tabId":"TAB_ID"}}}
+      Use the target section break's index. The first break (index 0) sets the tab's
+      document default; later breaks set a section header. Existing headers cause
+      an error, so inspect before creating. The reply returns headerId/footerId;
+      read again, then insert content in a second call using that ID as segmentId.
+      To remove a header use deleteHeader:{headerId,tabId}; for a footer use
+      deleteFooter:{footerId,tabId}. Deleting a section override may restore inheritance.
+      createFootnote takes a body location and returns footnoteId for a later edit.
+
+    IMAGES
+      Map paragraph inlineObjectElement.inlineObjectId to documentTab.inlineObjects;
+      floating objects are in positionedObjects. Read the image object ID to replace:
+        {"replaceImage":{"imageObjectId":"IMAGE_ID","uri":"https://example.com/image.png","imageReplaceMethod":"CENTER_CROP","tabId":"TAB_ID"}}
+      Insert at a paragraph location (optionally add segmentId for a header/footer):
+        {"insertInlineImage":{"uri":"https://example.com/image.png","location":{"index":1,"tabId":"TAB_ID"},"objectSize":{"width":{"magnitude":120,"unit":"PT"}}}}
+      Google must be able to fetch the image URL; local paths and private URLs do not
+      work. Inline images are deleted with deleteContentRange over their exact element
+      range; floating images use deletePositionedObject:{objectId,tabId}. Replacement
+      keeps the existing bounds and CENTER_CROP can crop; some image effects are lost.
+
+    SECTIONS / PAGE LAYOUT
+      Read body.content[].sectionBreak.sectionStyle and documentTab.documentStyle.
+      Change only named fields; fields is relative to the style, not prefixed by it:
+        {"updateSectionStyle":{"range":{"startIndex":1,"endIndex":2,"tabId":"TAB_ID"},"sectionStyle":{"marginLeft":{"magnitude":54,"unit":"PT"}},"fields":"marginLeft"}}
+        {"updateDocumentStyle":{"documentStyle":{"marginTop":{"magnitude":54,"unit":"PT"}},"fields":"marginTop","tabId":"TAB_ID"}}
+      A section range affects every section it overlaps. Body-only breaks omit segmentId:
+        {"insertSectionBreak":{"sectionType":"NEXT_PAGE","location":{"index":1,"tabId":"TAB_ID"}}}
+      insertPageBreak uses a body paragraph location too. Some page-layout features
+      require paged mode; inspect documentStyle and respect Google's restrictions.
+
+    TABS
+      Inspect tabs[].tabProperties and recurse through childTabs. Create/rename:
+        {"addDocumentTab":{"tabProperties":{"title":"Appendix"}}}
+        {"updateDocumentTabProperties":{"tabProperties":{"tabId":"TAB_ID","title":"Appendix"},"fields":"title"}}
+      Use tabProperties.index/parentTabId to position or nest tabs (explicit fields
+      for updates). Read the new tab's ID from the reply or a fresh document read.
+      deleteTab:{tabId} also deletes that tab's children. Most requests default to
+      the first tab; replaceAllText, deleteNamedRange and replaceNamedRangeContent
+      default to all tabs, so scope those with tabsCriteria:{tabIds:[...]}.
+
+    TABLES / ROWS / COLUMNS
+      Find the table in body/segment content; use its structural startIndex, not
+      a cell paragraph's start. Match text to the intended table/row and inspect
+      tableCellStyle.rowSpan/columnSpan before deleting a merged cell's row/column:
+        {"deleteTableRow":{"tableCellLocation":{"tableStartLocation":{"index":10,"tabId":"TAB_ID"},"rowIndex":1,"columnIndex":0}}}
+      Row/column indices start at zero. deleteTableColumn uses the same location;
+      insertTableRow adds insertBelow, insertTableColumn adds insertRight. A merged
+      cell can delete multiple rows/columns; deleting the last removes the table.
+      mergeTableCells/unmergeTableCells take tableRange with tableCellLocation and
+      rowSpan/columnSpan. Use updateTableCellStyle/updateTableRowStyle/
+      updateTableColumnProperties for formatting. Insert tables in one call, read
+      the resulting cell indices, then populate text in a later call.
+
+    Use narrow field masks to avoid resetting unrelated styles. Do not delete final
+    segment/cell newlines or only part of a structural element. The API may expose
+    read-only fields without a mutation request; do not invent unsupported methods.
+    Schemas: https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request
+
+    Args:
+        doc_id: Google Doc ID
+        requests_json: Non-empty JSON array of native Request objects. Each
+                       object has exactly one request type mapped to its payload.
+        required_revision_id: revisionId from the document snapshot used to plan edits
+        suggest: Record suggestions; Google refuses some request types in this mode.
+                 Never fall back to direct edits if suggestions were requested.
+        dry_run: Preview the body without writing. Checks the envelope locally;
+                 does NOT validate payloads or revision against Google.
+
+    Returns:
+        ok, dry_run, request_count, and the full Google response (replies,
+        writeControl, etc.), or body for a preview. Suggestion IDs are verified
+        when suggest=True, just as for the anchor-based editing tools.
+    """
+    result = docs_edit.advanced_edit(
+        doc_id, json.loads(requests_json), required_revision_id, suggest=suggest, dry_run=dry_run,
+    )
     return json.dumps(result, indent=2)
 
 

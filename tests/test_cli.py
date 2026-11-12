@@ -16,6 +16,7 @@ EDIT_COMMANDS = {
     "delete_paragraph": (["--anchor", "a"], "delete_paragraph"),
     "append": (["--text", "t"], "append"),
     "batch_replace": (["--replacements", '[{"find": "a", "replace": "b"}]'], "batch_replace"),
+    "advanced_edit": (["--requests", '[{"createHeader": {"type": "DEFAULT"}}]', "--required-revision-id", "r1"], "advanced_edit"),
 }
 
 
@@ -50,6 +51,18 @@ class CliTest(unittest.TestCase):
             run_cli("list_suggestions", "DOC", "--include-closed")
 
         listing.assert_called_once_with("DOC", include_closed=True)
+
+    def test_raw_read(self):
+        with mock.patch.object(docs_edit, "get_raw", return_value={"revisionId": "r1"}) as get:
+            self.assertEqual(run_cli("get_raw", "DOC", "--fields", "tabs"), {"revisionId": "r1"})
+        get.assert_called_once_with("DOC", "tabs")
+
+    def test_advanced_edit_options(self):
+        requests = [{"createHeader": {"type": "DEFAULT"}}]
+        with mock.patch.object(docs_edit, "advanced_edit", return_value={"ok": True}) as update:
+            run_cli("advanced_edit", "DOC", "--requests", json.dumps(requests),
+                    "--required-revision-id", "r1", "--dry-run", "--suggest")
+        update.assert_called_once_with("DOC", requests, "r1", suggest=True, dry_run=True)
 
     def test_review_suggestions(self):
         with mock.patch.object(docs_edit, "review_suggestions", return_value={"ok": True}) as review:

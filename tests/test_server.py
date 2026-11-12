@@ -9,6 +9,7 @@ from unittest import mock
 
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from googleapiclient.discovery_cache import get_static_doc
 
 import docs_edit
 import server
@@ -20,6 +21,7 @@ EDIT_TOOLS = {
     "docs_delete_paragraph": "delete_paragraph",
     "docs_append": "append",
     "docs_batch_replace": "batch_replace",
+    "docs_advanced_edit": "advanced_edit",
 }
 
 # Minimal valid arguments for each edit tool.
@@ -30,6 +32,7 @@ EDIT_ARGUMENTS = {
     "docs_delete_paragraph": {"doc_id": "d", "anchor": "a"},
     "docs_append": {"doc_id": "d", "text": "t"},
     "docs_batch_replace": {"doc_id": "d", "replacements_json": '[{"find": "a", "replace": "b"}]'},
+    "docs_advanced_edit": {"doc_id": "d", "requests_json": '[{"createHeader": {"type": "DEFAULT"}}]', "required_revision_id": "r1"},
 }
 
 
@@ -169,6 +172,65 @@ class SuggestOptionReachesDocsEditTest(unittest.TestCase):
                 call_tool("docs_review_suggestions", doc_id="d", action="approve", suggestion_ids=["s1"])
 
         review.assert_not_called()
+
+
+class StructureToolTest(unittest.TestCase):
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def test_advanced_recipes_are_visible_to_mcp_clients_and_match_google_schemas(self):
+        tools = list_tools()
+        self.assertNotIn("docs_delete_table_row", tools)
+        description = tools["docs_advanced_edit"].description
+        # FastMCP can omit prose following Args/Returns. Verify the actual tool
+        # description seen by clients, not the Python docstring or README.
+        examples = [json.loads(line) for line in description.splitlines() if line.strip().startswith("{")]
+        self.assertTrue({"createHeader", "insertText", "replaceImage", "insertInlineImage",
+                         "updateSectionStyle", "updateDocumentStyle", "insertSectionBreak",
+                         "addDocumentTab", "updateDocumentTabProperties", "deleteTableRow"}
+                        .issubset({name for example in examples for name in example}))
+        schemas = json.loads(get_static_doc("docs", "v1"))["schemas"]
+
+        def validate_fields(value, schema):
+            if "$ref" in schema:
+                schema = schemas[schema["$ref"]]
+            if isinstance(value, dict):
+                properties = schema.get("properties", {})
+                self.assertFalse(set(value) - set(properties), f"Unknown fields in {value}")
+                for key, child in value.items():
+                    validate_fields(child, properties[key])
+            elif "enum" in schema:
+                self.assertIn(value, schema["enum"])
+
+        for example in examples:
+            with self.subTest(example=example):
+                validate_fields(example, schemas["Request"])
+        self.assertIn("documentTab", tools["docs_get_raw"].description)
+        self.assertIn("sectionStyle", tools["docs_get_raw"].description)
+
+    def test_raw_read_options_and_native_response(self):
+        reply = {"revisionId": "r1", "tabs": [{"documentTab": {"headers": {"h1": {}}}}]}
+        with mock.patch.object(docs_edit, "get_raw", return_value=reply) as get:
+            result = call_tool("docs_get_raw", doc_id="d", fields="tabs")
+        get.assert_called_once_with("d", "tabs")
+        self.assertEqual(result_json(result), reply)
+
+    def test_raw_write_requires_revision_and_passes_native_payload(self):
+        schema = schema_of(list_tools()["docs_advanced_edit"])
+        self.assertEqual(schema["required"], ["doc_id", "requests_json", "required_revision_id"])
+        requests = [{"deleteTableColumn": {"tableCellLocation": {"rowIndex": 1}}}]
+        with mock.patch.object(docs_edit, "advanced_edit", return_value={"ok": True}) as update:
+            call_tool("docs_advanced_edit", doc_id="d", requests_json=json.dumps(requests),
+                      required_revision_id="r1", suggest=True, dry_run=True)
+        update.assert_called_once_with("d", requests, "r1", suggest=True, dry_run=True)
+
+    def test_malformed_or_wrong_shaped_raw_requests_return_tool_errors_before_api_calls(self):
+        with mock.patch.object(docs_edit, "_get_service") as service:
+            for value in ("not json", "{}", "[]", '[{"insertText": null}]'):
+                with self.subTest(value=value), self.assertRaises(ToolError):
+                    call_tool("docs_advanced_edit", doc_id="d", requests_json=value, required_revision_id="r1")
+        service.assert_not_called()
 
 
 class ConvertToolTest(unittest.TestCase):
